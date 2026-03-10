@@ -16,11 +16,16 @@ import json
 import logging
 import os
 from contextlib import AsyncExitStack
+from pathlib import Path
 from typing import Any, Optional
 
-import anthropic
+from dotenv import load_dotenv
+from openai import AsyncOpenAI
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+
+# Load .env from backend/ directory
+load_dotenv(Path(__file__).parent.parent / '.env')
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +36,7 @@ _DEFAULT_ARGS = json.loads(
     os.environ.get("BLENDER_MCP_ARGS", '["blender-mcp"]')
 )
 
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-5")
+GLM_MODEL = os.environ.get("GLM_MODEL", "Kimi-K2.5")
 SYSTEM_PROMPT = """\
 You are an expert Blender 3D modelling assistant that controls Blender through MCP tools.
 Your goal is to produce high-definition, production-quality 3D models and export them as GLB files.
@@ -185,8 +190,18 @@ class BlenderMCPClient:
     """
 
     def __init__(self) -> None:
-        self._anthropic = anthropic.AsyncAnthropic(
-            api_key=os.environ.get("ANTHROPIC_API_KEY", "")
+        api_key = os.environ.get("API_KEY")
+        base_url = os.environ.get("GLM_BASE_URL", "https://claudee.openai.azure.com/openai/v1")
+        if not api_key:
+            logger.error(
+                "API_KEY not set. Set it in .env file."
+            )
+
+        self._client = AsyncOpenAI(
+            api_key=api_key, 
+            base_url=base_url,
+            timeout=120.0,  # 2 minutes timeout
+            max_retries=2
         )
         self._session: Optional[ClientSession] = None
         self._exit_stack = AsyncExitStack()
@@ -293,26 +308,45 @@ class BlenderMCPClient:
 
         tool_calls_made: list[dict] = []
 
+        # Convert MCP tools to OpenAI format
+        openai_tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": t["name"],
+                    "description": t["description"],
+                    "parameters": t["input_schema"],
+                },
+            }
+            for t in self._tools
+        ]
+
+        # Prepare messages for OpenAI (system message separate)
+        openai_messages = [
+            {"role": "system", "content": SYSTEM_PROMPT}
+        ] + messages
+
         async with self._lock:
             while True:
-                response = await self._anthropic.messages.create(
-                    model=CLAUDE_MODEL,
+                response = await self._client.chat.completions.create(
+                    model=GLM_MODEL,
+                    messages=openai_messages,
+                    tools=openai_tools if openai_tools else None,
+                    tool_choice="auto" if openai_tools else None,
                     max_tokens=4096,
-                    system=SYSTEM_PROMPT,
-                    tools=self._tools,          # type: ignore[arg-type]
-                    messages=messages,
+                    temperature=0.2,
                 )
 
-                if response.stop_reason == "end_turn":
-                    final_text = "".join(
-                        block.text
-                        for block in response.content
-                        if hasattr(block, "text")
-                    )
+                choice = response.choices[0]
+                message = choice.message
+
+                # Check if finished
+                if choice.finish_reason == "stop":
+                    final_text = message.content or ""
                     # Persist assistant turn
                     conversation_store.append(
                         conversation_id,
-                        {"role": "assistant", "content": response.content},
+                        {"role": "assistant", "content": final_text},
                     )
                     glb_path = _extract_glb_path(final_text, tool_calls_made)
                     return {
@@ -322,77 +356,91 @@ class BlenderMCPClient:
                         "glb_path": glb_path,
                     }
 
-                if response.stop_reason == "tool_use":
-                    # Persist assistant turn (with tool_use blocks)
+                # Handle tool calls
+                if choice.finish_reason == "tool_calls" and message.tool_calls:
+                    # Persist assistant turn
                     conversation_store.append(
                         conversation_id,
-                        {"role": "assistant", "content": response.content},
+                        {
+                            "role": "assistant",
+                            "content": message.content,
+                            "tool_calls": [
+                                {
+                                    "id": tc.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc.function.name,
+                                        "arguments": tc.function.arguments,
+                                    },
+                                }
+                                for tc in message.tool_calls
+                            ],
+                        },
                     )
 
-                    tool_results = []
-                    for block in response.content:
-                        if block.type != "tool_use":
-                            continue
+                    # Execute each tool call
+                    for tool_call in message.tool_calls:
+                        func_name = tool_call.function.name
+                        try:
+                            func_args = json.loads(tool_call.function.arguments)
+                        except json.JSONDecodeError:
+                            func_args = {}
 
                         logger.info(
                             "Calling Blender tool '%s' with input: %s",
-                            block.name,
-                            block.input,
+                            func_name,
+                            func_args,
                         )
+
                         try:
                             mcp_result = await self._session.call_tool(
-                                block.name, block.input
+                                func_name, func_args
                             )
                             result_text = (
                                 mcp_result.content[0].text
                                 if mcp_result.content
                                 else "(no output)"
                             )
-                            is_error = False
                         except Exception as exc:
                             result_text = f"Error: {exc}"
-                            is_error = True
                             logger.error(
                                 "Tool '%s' raised an error: %s",
-                                block.name,
+                                func_name,
                                 exc,
                                 exc_info=True,
                             )
 
                         tool_calls_made.append(
                             {
-                                "tool": block.name,
-                                "input": block.input,
+                                "tool": func_name,
+                                "input": func_args,
                                 "result": result_text,
                             }
                         )
-                        tool_result: dict[str, Any] = {
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": result_text,
-                        }
-                        if is_error:
-                            tool_result["is_error"] = True
-                        tool_results.append(tool_result)
 
-                    # Feed results back for the next Claude turn
-                    conversation_store.append(
-                        conversation_id,
-                        {"role": "user", "content": tool_results},
-                    )
+                        # Append tool result for next turn
+                        conversation_store.append(
+                            conversation_id,
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "content": result_text,
+                            },
+                        )
+
+                    # Rebuild messages for next iteration
                     messages = conversation_store.get(conversation_id)
+                    openai_messages = [
+                        {"role": "system", "content": SYSTEM_PROMPT}
+                    ] + messages
                     continue  # next iteration
 
-                # Unexpected stop reason — return whatever we have
-                logger.warning("Unexpected stop_reason: %s", response.stop_reason)
-                any_text = "".join(
-                    block.text
-                    for block in response.content
-                    if hasattr(block, "text")
-                )
-                glb_path = _extract_glb_path(any_text, tool_calls_made)
+                # Unexpected finish reason
+                logger.warning("Unexpected finish_reason: %s", choice.finish_reason)
+                final_text = message.content or "(no response)"
+                glb_path = _extract_glb_path(final_text, tool_calls_made)
                 return {
-                    "response": any_text or "(no response)",
+                    "response": final_text,
                     "tool_calls": tool_calls_made,
                     "conversation_id": conversation_id,
                     "glb_path": glb_path,

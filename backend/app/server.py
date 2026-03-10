@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 
 from app.blender_mcp import blender_client, conversation_store
 
-ROOT_DIR = Path(__file__).parent
+ROOT_DIR = Path(__file__).parent.parent  # backend/
 load_dotenv(ROOT_DIR / '.env')
 
 logging.basicConfig(level=logging.INFO)
