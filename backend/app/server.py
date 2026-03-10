@@ -2,7 +2,7 @@ from fastapi import FastAPI, APIRouter, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone, timedelta
 from groq import Groq
 from tavily import TavilyClient
@@ -14,6 +14,8 @@ import asyncio
 import uuid
 from pathlib import Path
 from dotenv import load_dotenv
+
+from app.blender_mcp import blender_client, conversation_store
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -330,9 +332,138 @@ async def root():
     return {"message": "3D Model Discovery API", "version": "1.0"}
 
 
+# ─── Blender MCP Models ───────────────────────────────────────────────────────
+
+class BlenderConnectRequest(BaseModel):
+    command: str = "uvx"
+    args: List[str] = ["blender-mcp"]
+
+
+class ToolCallInfo(BaseModel):
+    tool: str
+    input: Dict[str, Any]
+    result: str
+
+
+class BlenderChatRequest(BaseModel):
+    message: str
+    conversation_id: Optional[str] = None
+
+
+class BlenderChatResponse(BaseModel):
+    response: str
+    tool_calls: List[ToolCallInfo]
+    conversation_id: str
+    glb_path: Optional[str] = None
+
+
+# ─── Blender MCP Routes ───────────────────────────────────────────────────────
+
+@api_router.post("/blender/connect")
+async def blender_connect(request: BlenderConnectRequest = BlenderConnectRequest()):
+    """
+    Start the Blender MCP server subprocess and connect to it.
+    Blender must already be running with the blender-mcp addon enabled.
+    """
+    if blender_client.is_connected:
+        return {
+            "status": "already_connected",
+            "tools": blender_client.tools,
+        }
+    try:
+        tools = await blender_client.connect(
+            command=request.command, args=request.args
+        )
+        return {"status": "connected", "tools": tools}
+    except Exception as exc:
+        logger.error("Blender MCP connect error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@api_router.post("/blender/disconnect")
+async def blender_disconnect():
+    """Disconnect from the Blender MCP server."""
+    if not blender_client.is_connected:
+        return {"status": "not_connected"}
+    try:
+        await blender_client.disconnect()
+        return {"status": "disconnected"}
+    except Exception as exc:
+        logger.error("Blender MCP disconnect error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@api_router.get("/blender/status")
+async def blender_status():
+    """Return connection status and available tools."""
+    return {
+        "connected": blender_client.is_connected,
+        "tools": blender_client.tools if blender_client.is_connected else [],
+        "conversations": conversation_store.list_ids(),
+    }
+
+
+@api_router.get("/blender/tools")
+async def blender_tools():
+    """List all tools exposed by the connected Blender MCP server."""
+    if not blender_client.is_connected:
+        raise HTTPException(
+            status_code=503,
+            detail="Not connected to Blender MCP server. POST /api/blender/connect first.",
+        )
+    return {"tools": blender_client.tools}
+
+
+@api_router.post("/blender/chat", response_model=BlenderChatResponse)
+async def blender_chat(request: BlenderChatRequest):
+    """
+    Send a natural-language message to Claude.  Claude has access to all
+    Blender MCP tools and will call them automatically to fulfil the request.
+
+    Pass `conversation_id` to continue an existing conversation; omit it (or
+    pass null) to start a new one.  The returned `conversation_id` should be
+    forwarded in subsequent requests.
+    """
+    if not blender_client.is_connected:
+        raise HTTPException(
+            status_code=503,
+            detail="Not connected to Blender MCP server. POST /api/blender/connect first.",
+        )
+
+    message = request.message.strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Message cannot be empty.")
+
+    conversation_id = request.conversation_id or str(uuid.uuid4())
+
+    try:
+        result = await blender_client.chat(
+            user_message=message,
+            conversation_id=conversation_id,
+        )
+        return BlenderChatResponse(
+            response=result["response"],
+            tool_calls=[ToolCallInfo(**tc) for tc in result["tool_calls"]],
+            conversation_id=result["conversation_id"],
+            glb_path=result.get("glb_path"),
+        )
+    except Exception as exc:
+        logger.error("Blender chat error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@api_router.delete("/blender/conversation/{conversation_id}")
+async def blender_clear_conversation(conversation_id: str):
+    """Clear a conversation's history."""
+    conversation_store.clear(conversation_id)
+    return {"status": "cleared", "conversation_id": conversation_id}
+
+
 app.include_router(api_router)
 
 
 @app.on_event("shutdown")
 async def shutdown_db():
     db_client.close()
+    if blender_client.is_connected:
+        await blender_client.disconnect()
