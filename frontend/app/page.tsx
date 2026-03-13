@@ -18,7 +18,9 @@ const API = `${process.env.NEXT_PUBLIC_BACKEND_URL}/api`;
 const LOADING_STEPS = [
   { label: "Analyzing prompt...", sub: "GROQ::LLM_REFINE" },
   { label: "Scanning the web...", sub: "TAVILY::WEB_SEARCH" },
-  { label: "Extracting model data...", sub: "PARSER::GLTF_RESOLVE" },
+  { label: "Downloading models...", sub: "SKETCHFAB::FETCH" },
+  { label: "Running AI scoring...", sub: "CLIP::GEOMETRIC_ANALYSIS" },
+  { label: "Applying decision gates...", sub: "THRESHOLD::FILTER" },
   { label: "Finalizing results...", sub: "DB::COMMIT" },
 ];
 
