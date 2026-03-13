@@ -14,8 +14,26 @@ import asyncio
 import uuid
 from pathlib import Path
 from dotenv import load_dotenv
+import httpx
+import tempfile
+import aiofiles
 
 from app.blender_mcp import blender_client, conversation_store
+from app.model_scorer import (
+    score_model, 
+    score_candidates, 
+    THRESHOLD_LABELLED, 
+    THRESHOLD_UNLABELLED,
+    SEMANTIC_WEIGHT,
+    GEOMETRIC_WEIGHT
+)
+from app.sketchfab_fetcher import (
+    fetch_model,
+    classify_url,
+    ModelSource,
+    FetchResult,
+    SketchfabMetadata
+)
 
 ROOT_DIR = Path(__file__).parent.parent  # backend/
 load_dotenv(ROOT_DIR / '.env')
@@ -57,6 +75,17 @@ class ModelInfo(BaseModel):
     title: str
     source_url: str
     source_domain: str
+    # Sketchfab metadata
+    description: Optional[str] = None
+    tags: List[str] = []
+    categories: List[str] = []
+    vertex_count: Optional[int] = None
+    face_count: Optional[int] = None
+    animation_count: Optional[int] = None
+    is_downloadable: Optional[bool] = None
+    license: Optional[str] = None
+    author: Optional[str] = None
+    thumbnail_url: Optional[str] = None
 
 class SearchRecord(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -80,6 +109,28 @@ class SearchResponse(BaseModel):
     status: str
     error_message: Optional[str]
     created_at: str
+
+class ModelScoreRequest(BaseModel):
+    model_url: str
+    prompt: str
+    metadata: Optional[Dict[str, Any]] = None
+
+class ModelScoreResponse(BaseModel):
+    final_score: float
+    is_labelled: bool
+    decision: str  # USE / REFETCH / CACHE / DISCARD
+    semantic_score: float
+    geometric_score: float
+    details: Dict[str, Any]
+
+class BatchScoreRequest(BaseModel):
+    search_id: str
+    prompt: str
+
+class BatchScoreResponse(BaseModel):
+    search_id: str
+    ranked_models: List[Dict[str, Any]]
+    best_model: Optional[Dict[str, Any]]
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -105,7 +156,8 @@ def is_direct_model_url(url: str) -> bool:
     lo = url.lower().split('?')[0]
     return lo.endswith('.glb') or lo.endswith('.gltf')
 
-def resolve_model_from_result(result: dict) -> Optional[ModelInfo]:
+# Update resolve_model_from_result to be async and fetch metadata
+async def resolve_model_from_result(result: dict) -> Optional[ModelInfo]:
     url = result.get('url', '')
     title = result.get('title', 'Untitled')
     content = result.get('content', '')
@@ -113,8 +165,36 @@ def resolve_model_from_result(result: dict) -> Optional[ModelInfo]:
     # 1. Sketchfab URL
     sf_id = extract_sketchfab_id(url)
     if sf_id:
+        # Fetch rich metadata from Sketchfab API using the fetcher
+        sketchfab_api_key = os.environ.get('SKETCHFAB_API_KEY', '')
+        
+        try:
+            from app.sketchfab_fetcher import fetch_sketchfab_metadata as fetch_sf_meta
+            metadata_obj = await fetch_sf_meta(sf_id, sketchfab_api_key)
+            
+            if metadata_obj and metadata_obj.title:
+                return ModelInfo(
+                    type="sketchfab",
+                    url=url,  # ✅ Add source URL for fetching/downloading
+                    embed_url=f"https://sketchfab.com/models/{sf_id}/embed?autostart=1&ui_hint=0&ui_infos=0",
+                    title=metadata_obj.title or title,
+                    source_url=url,
+                    source_domain="sketchfab.com",
+                    description=metadata_obj.description,
+                    tags=metadata_obj.tags,
+                    face_count=metadata_obj.face_count,
+                    is_downloadable=metadata_obj.is_downloadable,
+                    license=metadata_obj.license,
+                    author=metadata_obj.author,
+                    thumbnail_url=metadata_obj.thumbnail_url,
+                )
+        except Exception as e:
+            logger.warning(f"Failed to fetch Sketchfab metadata for {sf_id}: {e}")
+        
+        # Fallback if API fails
         return ModelInfo(
             type="sketchfab",
+            url=url,  # ✅ Add source URL for fetching/downloading
             embed_url=f"https://sketchfab.com/models/{sf_id}/embed?autostart=1&ui_hint=0&ui_infos=0",
             title=title,
             source_url=url,
@@ -202,10 +282,12 @@ async def refine_prompt_with_groq(prompt: str) -> SearchAttributes:
 async def search_models_with_tavily(attributes: SearchAttributes) -> List[ModelInfo]:
     loop = asyncio.get_event_loop()
 
+    # Prioritize direct downloads from free model repositories
     queries = [
-        f"{attributes.refined_query} 3d model site:sketchfab.com",
-        f"{attributes.refined_query} free 3d model gltf glb download",
-        f"{attributes.object_type} {attributes.style} 3d model sketchfab",
+        f"{attributes.refined_query} 3d model glb gltf download site:polyhaven.com OR site:quaternius.com OR site:kenney.nl",
+        f"{attributes.refined_query} free 3d model .glb .gltf direct download CC0",
+        f"{attributes.object_type} {attributes.style} 3d asset glb gltf free download",
+        f"{attributes.refined_query} 3d model site:sketchfab.com",  # Fallback to Sketchfab last
     ]
 
     async def _search(query: str):
@@ -229,7 +311,7 @@ async def search_models_with_tavily(attributes: SearchAttributes) -> List[ModelI
     seen = set()
     for batch in all_raw:
         for result in batch:
-            model = resolve_model_from_result(result)
+            model = await resolve_model_from_result(result)  # Add await
             if model:
                 key = model.embed_url or model.url or model.source_url
                 if key and key not in seen:
@@ -268,13 +350,254 @@ async def search_models(request: SearchRequest):
     try:
         attributes = await refine_prompt_with_groq(prompt)
         models = await search_models_with_tavily(attributes)
-        primary = models[0] if models else None
-        status = "completed" if primary else "no_model"
+        
+        if not models:
+            update = {
+                "attributes": attributes.model_dump(),
+                "primary_model": None,
+                "all_models": [],
+                "status": "no_model",
+            }
+            await db.searches.update_one({"id": record.id}, {"$set": update})
+            return SearchResponse(
+                id=record.id,
+                original_prompt=prompt,
+                attributes=attributes,
+                primary_model=None,
+                all_models=[],
+                status="no_model",
+                error_message=None,
+                created_at=record.created_at.isoformat(),
+            )
+
+        # ─── SCORING & DECISION GATES ───────────────────────────────────────
+        logger.info(f"\n{'='*80}")
+        logger.info(f"Found {len(models)} models, starting scoring pipeline...")
+        logger.info(f"{'='*80}")
+        for idx, m in enumerate(models[:5], 1):
+            logger.info(f"  [{idx}] {m.title[:60]} | Type: {m.type} | URL: {m.url}")
+        logger.info(f"{'='*80}\n")
+        
+        sketchfab_api_key = os.environ.get('SKETCHFAB_API_KEY', '')
+        if not sketchfab_api_key:
+            logger.warning("⚠️  SKETCHFAB_API_KEY not set - downloadable models will be skipped!")
+        
+        scored_models = []
+        all_scoring_results = []  # Track all models for summary
+        
+        # Download and score each model
+        for i, model in enumerate(models[:5], 1):  # Limit to top 5 to avoid long delays
+            model_url = model.url
+            if not model_url:
+                continue
+                
+            try:
+                logger.info(f"[{i}/{min(len(models), 5)}] Fetching {model_url}")
+                
+                # Download model
+                fetch_result = await fetch_model(
+                    url=model_url,
+                    sketchfab_api_key=sketchfab_api_key
+                )
+                
+                logger.info(f"[{i}/{min(len(models), 5)}] Fetch status: {fetch_result.status.value}, is_scorable: {fetch_result.is_scorable}, local_path: {fetch_result.local_path}")
+                
+                # Only score if successfully fetched
+                if fetch_result.is_scorable and fetch_result.local_path:
+                    # fetch_result.metadata is already a dict with title, description, tags
+                    metadata = fetch_result.metadata if fetch_result.metadata else {
+                        "title": model.title,
+                        "description": model.description or "",
+                        "tags": model.tags,
+                    }
+                    
+                    logger.info(f"[{i}/{min(len(models), 5)}] Scoring model...")
+                    
+                    # Run scoring in thread pool
+                    loop = asyncio.get_event_loop()
+                    score_result = await loop.run_in_executor(
+                        None,
+                        score_model,
+                        str(fetch_result.local_path),
+                        prompt,
+                        metadata
+                    )
+                    
+                    # Log detailed scoring breakdown
+                    logger.info(f"\n{'='*70}")
+                    logger.info(f"[{i}/{min(len(models), 5)}] SCORING RESULT: {model.title[:50]}")
+                    logger.info(f"{'='*70}")
+                    logger.info(f"  Semantic Score:  {score_result.semantic.combined:.4f} (CLIP: {score_result.semantic.clip_score:.4f}, Metadata: {score_result.semantic.metadata_score:.4f})")
+                    logger.info(f"  Geometric Score: {score_result.geometric.combined:.4f}")
+                    logger.info(f"  Final Score:     {score_result.final_score:.4f} = {SEMANTIC_WEIGHT:.1f}×{score_result.semantic.combined:.4f} + {GEOMETRIC_WEIGHT:.1f}×{score_result.geometric.combined:.4f}")
+                    logger.info(f"  Is Labelled:     {score_result.is_labelled}")
+                    logger.info(f"  Decision:        {score_result.decision}")
+                    logger.info(f"-" * 70)
+                    
+                    # Store all results for summary
+                    all_scoring_results.append({
+                        "title": model.title[:40],
+                        "score": score_result.final_score,
+                        "semantic": score_result.semantic.combined,
+                        "geometric": score_result.geometric.combined,
+                        "labelled": score_result.is_labelled,
+                        "decision": score_result.decision,
+                    })
+                    
+                    # Apply decision gates - only USE and CACHE models are shown
+                    if score_result.decision in ["USE", "CACHE"]:
+                        if score_result.decision == "USE":
+                            logger.info(f"  ✅ APPROVED (USE): Labelled + Score {score_result.final_score:.4f} > {THRESHOLD_LABELLED:.2f} threshold")
+                            logger.info(f"     → Model has named nodes and good quality. Ready for immediate use!")
+                        else:  # CACHE
+                            logger.info(f"  ✅ APPROVED (CACHE): Unlabelled + Score {score_result.final_score:.4f} > {THRESHOLD_UNLABELLED:.2f} threshold")
+                            logger.info(f"     → High quality but needs labeling. Will trigger Blender MCP for node naming.")
+                        
+                        scored_models.append({
+                            "model": model,
+                            "score": score_result.final_score,
+                            "decision": score_result.decision,
+                            "is_labelled": score_result.is_labelled,
+                            "semantic_score": score_result.semantic.combined,
+                            "geometric_score": score_result.geometric.combined,
+                        })
+                        
+                        # TODO: If CACHE, trigger Blender MCP in background for labeling
+                        if score_result.decision == "CACHE":
+                            logger.info(f"     [TODO] Blender MCP labeling pipeline pending")
+                    
+                    elif score_result.decision == "REFETCH":
+                        logger.info(f"  ❌ REJECTED (REFETCH): Labelled but Score {score_result.final_score:.4f} ≤ {THRESHOLD_LABELLED:.2f} threshold")
+                        logger.info(f"     → Model has labels but is the WRONG OBJECT (semantic mismatch)")
+                        logger.info(f"     → Search fetched something irrelevant. Need better query refinement.")
+                    
+                    elif score_result.decision == "DISCARD":
+                        logger.info(f"  ❌ REJECTED (DISCARD): Unlabelled and Score {score_result.final_score:.4f} ≤ {THRESHOLD_UNLABELLED:.2f} threshold")
+                        logger.info(f"     → Model is either wrong object OR too low quality")
+                        logger.info(f"     → Not worth caching. Will generate from scratch with Blender.")
+                    
+                    logger.info(f"{'='*70}\n")
+                
+                else:
+                    # Model fetched but not scorable
+                    logger.warning(f"[{i}/{min(len(models), 5)}] ⚠️  Model NOT SCORABLE")
+                    logger.warning(f"     Status: {fetch_result.status.value}")
+                    logger.warning(f"     Reason: is_scorable={fetch_result.is_scorable}, has_local_path={bool(fetch_result.local_path)}")
+                    if fetch_result.status.value == "NOT_DOWNLOADABLE":
+                        logger.warning(f"     → Model is view-only (Sketchfab embed without download permission)")
+                    elif fetch_result.status.value == "DOWNLOAD_FAILED":
+                        logger.warning(f"     → Download failed - model may require authentication or be deleted")
+                    
+            except Exception as e:
+                logger.error(f"[{i}/{min(len(models), 5)}] ❌ EXCEPTION during fetch/score: {type(e).__name__}: {e}", exc_info=True)
+                continue
+        
+        # Sort by score (highest first)
+        scored_models.sort(key=lambda x: x["score"], reverse=True)
+        
+        # Extract approved models
+        approved_models = [item["model"] for item in scored_models]
+        primary = approved_models[0] if approved_models else None
+        
+        # ─── SCORING SUMMARY TABLE ───
+        logger.info(f"\n{'='*90}")
+        logger.info(f"  SCORING SUMMARY - {len(all_scoring_results)} MODELS EVALUATED")
+        logger.info(f"{'='*90}")
+        logger.info(f"  {'Model':<40} {'Final':<8} {'Sem':<7} {'Geo':<7} {'Labelled':<10} {'Decision':<10}")
+        logger.info(f"  {'-'*40} {'-'*8} {'-'*7} {'-'*7} {'-'*10} {'-'*10}")
+        
+        for result in all_scoring_results:
+            decision_symbol = "✅" if result["decision"] in ["USE", "CACHE"] else "❌"
+            labelled_str = "Yes" if result["labelled"] else "No"
+            logger.info(
+                f"  {result['title']:<40} {result['score']:.4f}   "
+                f"{result['semantic']:.4f}  {result['geometric']:.4f}  "
+                f"{labelled_str:<10} {decision_symbol} {result['decision']:<10}"
+            )
+        
+        logger.info(f"{'='*90}")
+        logger.info(f"  THRESHOLDS: Labelled models need >{THRESHOLD_LABELLED:.2f} | Unlabelled models need >{THRESHOLD_UNLABELLED:.2f}")
+        logger.info(f"  RESULT: {len(scored_models)} APPROVED / {len(all_scoring_results)} EVALUATED")
+        logger.info(f"{'='*90}\n")
+        
+        # ─── FALLBACK STRATEGIES: Return unscored models or generate procedural ───
+        if not approved_models:
+            logger.warning("⚠️  All models REJECTED by decision gates (REFETCH/DISCARD)")
+            
+            # Strategy 1: Return unscored Sketchfab models with embed URLs
+            unscored_sketchfab = [m for m in models[:5] if m.type == "sketchfab" and m.embed_url]
+            if unscored_sketchfab:
+                logger.info(f"📋 Returning {len(unscored_sketchfab)} unscored Sketchfab models (embed-only, no scoring)")
+                primary = unscored_sketchfab[0]
+                approved_models = unscored_sketchfab
+                status = "completed"
+            else:
+                # Strategy 2: Generate procedural model with Blender MCP
+                logger.info("🔧 Triggering Blender MCP for procedural generation...")
+                
+                try:
+                    # Connect to Blender MCP if not already connected
+                    if not blender_client.is_connected:
+                        logger.info("Connecting to Blender MCP server...")
+                        await blender_client.connect()
+                    
+                    # Generate model using Blender MCP
+                    blender_prompt = (
+                        f"Create a 3D model of: {prompt}. "
+                        f"Style: {attributes.style}. "
+                        f"Make it detailed and export as GLB."
+                    )
+                    
+                    conversation_id = str(uuid.uuid4())
+                    logger.info(f"[Blender] Sending prompt: {blender_prompt}")
+                    
+                    result = await blender_client.chat(
+                        user_message=blender_prompt,
+                        conversation_id=conversation_id,
+                    )
+                    
+                    glb_path = result.get("glb_path")
+                    
+                    if glb_path and Path(glb_path).exists():
+                        logger.info(f"✅ Blender generated model: {glb_path}")
+                        
+                        # Create ModelInfo for the Blender-generated model
+                        primary = ModelInfo(
+                            type="glb",
+                            url=f"file://{glb_path}",
+                            title=f"Procedural: {prompt}",
+                            source_url="blender://procedural",
+                            source_domain="blender-mcp",
+                            description=f"Procedurally generated by Blender MCP",
+                            tags=attributes.keywords,
+                        )
+                        approved_models = [primary]
+                        status = "completed"
+                    else:
+                        logger.error("❌ Blender MCP failed to generate model")
+                        status = "no_model"
+                        
+                except Exception as e:
+                    logger.error(f"❌ Blender fallback failed: {e}", exc_info=True)
+                    status = "no_model"
+        else:
+            status = "completed"
 
         update = {
             "attributes": attributes.model_dump(),
             "primary_model": primary.model_dump() if primary else None,
-            "all_models": [m.model_dump() for m in models],
+            "all_models": [m.model_dump() for m in approved_models],
+            "scored_results": [
+                {
+                    "model": item["model"].model_dump(),  # Convert ModelInfo to dict
+                    "score": item["score"],
+                    "decision": item["decision"],
+                    "is_labelled": item["is_labelled"],
+                    "semantic_score": item["semantic_score"],
+                    "geometric_score": item["geometric_score"],
+                }
+                for item in scored_models
+            ],
             "status": status,
         }
         await db.searches.update_one({"id": record.id}, {"$set": update})
@@ -284,7 +607,7 @@ async def search_models(request: SearchRequest):
             original_prompt=prompt,
             attributes=attributes,
             primary_model=primary,
-            all_models=models,
+            all_models=approved_models,
             status=status,
             error_message=None,
             created_at=record.created_at.isoformat(),
@@ -330,6 +653,202 @@ async def delete_history_item(search_id: str):
 @api_router.get("/")
 async def root():
     return {"message": "3D Model Discovery API", "version": "1.0"}
+
+
+# ─── Model Scoring Routes ─────────────────────────────────────────────────────
+
+@api_router.post("/score", response_model=ModelScoreResponse)
+async def score_single_model(request: ModelScoreRequest):
+    """
+    Score a single 3D model using the composite scorer.
+    Supports both direct GLB/GLTF URLs and Sketchfab URLs with download API.
+    """
+    try:
+        # Get Sketchfab API key from environment
+        sketchfab_api_key = os.environ.get('SKETCHFAB_API_KEY', '')
+        
+        # Fetch the model using the comprehensive fetcher
+        fetch_result = await fetch_model(
+            url=request.model_url,
+            sketchfab_api_key=sketchfab_api_key
+        )
+        
+        # Check if model was successfully fetched
+        if not fetch_result.is_scorable or not fetch_result.local_path:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Model could not be downloaded: {fetch_result.status.value}"
+            )
+        
+        # Prepare metadata for scorer
+        metadata = request.metadata or {}
+        if fetch_result.metadata:
+            # Merge metadata from Sketchfab API
+            metadata = {
+                "title": fetch_result.metadata.title or metadata.get("title", ""),
+                "description": fetch_result.metadata.description or metadata.get("description", ""),
+                "tags": fetch_result.metadata.tags or metadata.get("tags", []),
+            }
+        else:
+            # Use provided metadata
+            metadata = {
+                "title": metadata.get("title", ""),
+                "description": metadata.get("description", ""),
+                "tags": metadata.get("tags", []),
+            }
+        
+        # Run scorer in thread pool (CPU-intensive)
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            score_model,
+            str(fetch_result.local_path),
+            request.prompt,
+            metadata
+        )
+        
+        # Clean up temp file (fetcher may have cached it, but respect our own cleanup)
+        # Note: fetcher may cache files, so we don't always want to delete
+        # For now, let the fetcher handle caching
+        
+        return ModelScoreResponse(
+            final_score=result.final_score,
+            is_labelled=result.is_labelled,
+            decision=result.decision,
+            semantic_score=result.semantic.combined,
+            geometric_score=result.geometric.combined,
+            details={
+                "semantic": {
+                    "clip_score": result.semantic.clip_score,
+                    "metadata_score": result.semantic.metadata_score,
+                },
+                "geometric": {
+                    "polygon_density": result.geometric.polygon_density,
+                    "mesh_node_count": result.geometric.mesh_node_count,
+                    "node_hierarchy_depth": result.geometric.node_hierarchy_depth,
+                    "uv_coverage": result.geometric.uv_coverage,
+                    "material_diversity": result.geometric.material_diversity,
+                }
+            }
+        )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Scoring error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Scoring failed: {str(e)}")
+
+
+@api_router.post("/score/batch", response_model=BatchScoreResponse)
+async def score_search_results(request: BatchScoreRequest):
+    """
+    Score all models from a search result and rank them.
+    Supports direct GLB/GLTF URLs and Sketchfab download API.
+    """
+    # Get search record
+    record = await db.searches.find_one({"id": request.search_id}, {"_id": 0})
+    if not record:
+        raise HTTPException(status_code=404, detail="Search not found")
+    
+    all_models = record.get("all_models", [])
+    if not all_models:
+        raise HTTPException(status_code=404, detail="No models found in this search")
+    
+    # Get Sketchfab API key
+    sketchfab_api_key = os.environ.get('SKETCHFAB_API_KEY', '')
+    
+    logger.info(f"Attempting to score {len(all_models)} models from search {request.search_id}")
+    
+    try:
+        # Prepare candidates for batch scoring
+        candidates = []
+        
+        for model in all_models:
+            model_url = model.get("url")
+            if not model_url:
+                continue
+                
+            try:
+                # Use fetcher to download model (supports both direct URLs and Sketchfab)
+                fetch_result = await fetch_model(
+                    url=model_url,
+                    sketchfab_api_key=sketchfab_api_key
+                )
+                
+                # Only add if successfully fetched
+                if fetch_result.is_scorable and fetch_result.local_path:
+                    metadata = {}
+                    if fetch_result.metadata:
+                        metadata = {
+                            "title": fetch_result.metadata.title,
+                            "description": fetch_result.metadata.description,
+                            "tags": fetch_result.metadata.tags,
+                        }
+                    else:
+                        metadata = {
+                            "title": model.get("title", ""),
+                            "description": model.get("description", ""),
+                            "tags": model.get("tags", []),
+                        }
+                    
+                    candidates.append({
+                        "model_path": str(fetch_result.local_path),
+                        "metadata": metadata,
+                        "original_model_info": model
+                    })
+                else:
+                    logger.warning(f"Skipped {model_url}: {fetch_result.status.value}")
+                    
+            except Exception as e:
+                logger.warning(f"Failed to fetch {model_url}: {e}")
+                continue
+        
+        if not candidates:
+            raise HTTPException(
+                status_code=400,
+                detail="No models could be downloaded for scoring"
+            )
+        
+        logger.info(f"Successfully fetched {len(candidates)} models, starting batch scoring")
+        
+        # Run batch scoring in thread pool
+        loop = asyncio.get_event_loop()
+        ranked = await loop.run_in_executor(
+            None,
+            score_candidates,
+            candidates,
+            request.prompt
+        )
+        
+        # Merge scores with original model info
+        for rank_result in ranked:
+            original_info = next(
+                (c["original_model_info"] for c in candidates 
+                 if c["model_path"] == rank_result.get("model_path")),
+                None
+            )
+            if original_info:
+                rank_result["model_info"] = original_info
+        
+        best_model = ranked[0] if ranked else None
+        
+        # Update search record with scores
+        await db.searches.update_one(
+            {"id": request.search_id},
+            {"$set": {"scored_models": ranked, "best_scored_model": best_model}}
+        )
+        
+        return BatchScoreResponse(
+            search_id=request.search_id,
+            ranked_models=ranked,
+            best_model=best_model
+        )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Batch scoring error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Batch scoring failed: {str(e)}")
 
 
 # ─── Blender MCP Models ───────────────────────────────────────────────────────
