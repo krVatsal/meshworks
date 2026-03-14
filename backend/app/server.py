@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Query
+from fastapi import FastAPI, APIRouter, HTTPException, Query, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field
@@ -16,6 +16,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from app.blender_mcp import blender_client, conversation_store
+from app.mesh_renamer import rename_meshes_from_file
 
 ROOT_DIR = Path(__file__).parent.parent  # backend/
 load_dotenv(ROOT_DIR / '.env')
@@ -330,6 +331,22 @@ async def delete_history_item(search_id: str):
 @api_router.get("/")
 async def root():
     return {"message": "3D Model Discovery API", "version": "1.0"}
+
+
+@api_router.post("/mesh/rename")
+async def mesh_rename(file: UploadFile = File(...), hint: str = Form(default="")):
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Missing file name")
+
+    try:
+        data = await file.read()
+        result = await rename_meshes_from_file(file.filename, data, hint=hint or "")
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error("Mesh rename error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 # ─── Blender MCP Models ───────────────────────────────────────────────────────
