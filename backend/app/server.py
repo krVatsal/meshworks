@@ -1,4 +1,5 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Query, UploadFile, File, Form
+from fastapi import FastAPI, APIRouter, HTTPException, Query, UploadFile, File, Form, BackgroundTasks
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field
@@ -36,7 +37,7 @@ from app.sketchfab_fetcher import (
     SketchfabMetadata
 )
 
-ROOT_DIR = Path(__file__).parent.parent  # backend/
+ROOT_DIR = Path(__file__).parent.parent.parent.parent  # Sankalp/
 load_dotenv(ROOT_DIR / '.env')
 
 logging.basicConfig(level=logging.INFO)
@@ -655,6 +656,25 @@ async def delete_history_item(search_id: str):
 async def root():
     return {"message": "3D Model Discovery API", "version": "1.0"}
 
+@api_router.get("/download")
+async def download_model(url: str, background_tasks: BackgroundTasks):
+    from app.sketchfab_fetcher import fetch_model
+    from dotenv import load_dotenv
+    load_dotenv(ROOT_DIR / '.env', override=True)
+    sketchfab_api_key = os.environ.get('SKETCHFAB_API_KEY', '')
+    
+    result = await fetch_model(url, sketchfab_api_key)
+    
+    if not result.local_path or not os.path.exists(result.local_path):
+        raise HTTPException(status_code=400, detail=f"Could not download model: {result.error}")
+        
+    filename = os.path.basename(result.local_path)
+    
+    return FileResponse(
+        path=result.local_path, 
+        filename=filename, 
+        media_type='application/octet-stream'
+    )
 
 @api_router.post("/mesh/rename")
 async def mesh_rename(file: UploadFile = File(...), hint: str = Form(default="")):
