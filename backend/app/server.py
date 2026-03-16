@@ -1,4 +1,5 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Query
+from fastapi import FastAPI, APIRouter, HTTPException, Query, UploadFile, File, Form, BackgroundTasks
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field
@@ -11,6 +12,7 @@ import logging
 import re
 import json
 import asyncio
+import shutil
 import uuid
 from pathlib import Path
 from dotenv import load_dotenv
@@ -19,6 +21,7 @@ import tempfile
 import aiofiles
 
 from app.blender_mcp import blender_client, conversation_store
+from app.mesh_renamer import rename_meshes_from_file
 from app.model_scorer import (
     score_model, 
     score_candidates, 
@@ -40,7 +43,7 @@ from app.conversation_service import (
     handle_model_chat,
 )
 
-ROOT_DIR = Path(__file__).parent.parent  # backend/
+ROOT_DIR = Path(__file__).parent.parent.parent.parent  # Sankalp/
 load_dotenv(ROOT_DIR / '.env')
 
 logging.basicConfig(level=logging.INFO)
@@ -63,6 +66,66 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ─── Segmentation helper ──────────────────────────────────────────────────────
+
+APP_DIR    = Path(__file__).parent          # …/app/
+INPUT_DIR  = APP_DIR / "input"
+OUTPUT_DIR = APP_DIR / "output"
+
+async def segment_model(local_path: str) -> Optional[str]:
+    """
+    Run segment_glb.py on a GLB that has no named mesh nodes
+    (single-mesh / unlabelled model).
+
+    Steps:
+      1. Copy the file into app/input/<filename>
+      2. Run:  python segment_glb.py <filename>
+         The script reads from app/input/ and writes to app/output/
+      3. Return the path to the segmented GLB, or None on failure.
+    """
+    INPUT_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(exist_ok=True)
+
+    src      = Path(local_path)
+    filename = src.name
+    dst      = INPUT_DIR / filename
+
+    shutil.copy2(src, dst)
+    logger.info(f"[segment] Copied {filename} -> {dst}")
+
+    script = APP_DIR / "segment_glb.py"
+    if not script.exists():
+        logger.error(f"[segment] segment_glb.py not found at {script}")
+        return None
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "python", str(script), filename,
+            "--max-segments", "20",
+            "--strategy", "auto",
+            cwd=str(APP_DIR),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await proc.communicate()
+        logger.info(f"[segment] Output:\n{stdout.decode(errors='replace')}")
+
+        if proc.returncode != 0:
+            logger.error(f"[segment] segment_glb.py exited with code {proc.returncode}")
+            return None
+
+        out_path = OUTPUT_DIR / filename
+        if out_path.exists():
+            logger.info(f"[segment] Segmented model saved -> {out_path}")
+            return str(out_path)
+
+        logger.error(f"[segment] Expected output not found: {out_path}")
+        return None
+
+    except Exception as e:
+        logger.error(f"[segment] Exception: {e}", exc_info=True)
+        return None
 
 # ─── Models ───────────────────────────────────────────────────────────────────
 
@@ -470,9 +533,19 @@ async def search_models(request: SearchRequest):
                         if score_result.node_names:
                             logger.info(f"  📦 Node names ({len(score_result.node_names)}): {score_result.node_names}")
                         
-                        # TODO: If CACHE, trigger Blender MCP in background for labeling
-                        if score_result.decision == "CACHE":
-                            logger.info(f"     [TODO] Blender MCP labeling pipeline pending")
+                        # Unlabelled single mesh → segment it to create named nodes
+                        if score_result.decision == "CACHE" and fetch_result.local_path:
+                            logger.info("     [segment] Single mesh — running segmentation ...")
+                            segmented_path = await segment_model(str(fetch_result.local_path))
+                            if segmented_path:
+                                logger.info(f"     [segment] ✅ Done: {segmented_path}")
+                                model = ModelInfo(
+                                    **{**model.model_dump(),
+                                       "url": f"/api/output/{Path(segmented_path).name}",
+                                       "description": (model.description or "") + " [segmented]"}
+                                )
+                            else:
+                                logger.warning("     [segment] ⚠️  Failed — using original model")
                     
                     elif score_result.decision == "REFETCH":
                         logger.info(f"  ❌ REJECTED (REFETCH): Labelled but Score {score_result.final_score:.4f} ≤ {THRESHOLD_LABELLED:.2f} threshold")
@@ -568,6 +641,13 @@ async def search_models(request: SearchRequest):
                     
                     if glb_path and Path(glb_path).exists():
                         logger.info(f"✅ Blender generated model: {glb_path}")
+
+                        # TODO: Segment the AI-generated model once Blender MCP
+                        # generation is fully implemented. Uncomment when ready:
+                        #
+                        #   segmented_path = await segment_model(glb_path)
+                        #   if segmented_path:
+                        #       glb_path = segmented_path
                         
                         # Create ModelInfo for the Blender-generated model
                         primary = ModelInfo(
@@ -673,7 +753,52 @@ async def model_chat(request: ChatRequest):
 async def root():
     return {"message": "3D Model Discovery API", "version": "1.0"}
 
+@api_router.get("/download")
+async def download_model(url: str, background_tasks: BackgroundTasks):
+    from app.sketchfab_fetcher import fetch_model
+    from dotenv import load_dotenv
+    load_dotenv(ROOT_DIR / '.env', override=True)
+    sketchfab_api_key = os.environ.get('SKETCHFAB_API_KEY', '')
+    
+    result = await fetch_model(url, sketchfab_api_key)
+    
+    if not result.local_path or not os.path.exists(result.local_path):
+        raise HTTPException(status_code=400, detail=f"Could not download model: {result.error}")
+        
+    filename = os.path.basename(result.local_path)
+    
+    return FileResponse(
+        path=result.local_path, 
+        filename=filename, 
+        media_type='application/octet-stream'
+    )
 
+@api_router.get("/output/{filename}")
+async def serve_output_file(filename: str):
+    """Serve segmented GLB files from app/output/ over HTTP."""
+    file_path = OUTPUT_DIR / filename
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail=f"File not found: {filename}")
+    return FileResponse(
+        path=str(file_path),
+        filename=filename,
+        media_type="model/gltf-binary"
+    )
+
+@api_router.post("/mesh/rename")
+async def mesh_rename(file: UploadFile = File(...), hint: str = Form(default="")):
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Missing file name")
+
+    try:
+        data = await file.read()
+        result = await rename_meshes_from_file(file.filename, data, hint=hint or "")
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error("Mesh rename error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 # ─── Model Scoring Routes ─────────────────────────────────────────────────────
 
 @api_router.post("/score", response_model=ModelScoreResponse)
