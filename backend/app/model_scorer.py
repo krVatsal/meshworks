@@ -85,7 +85,6 @@ class SemanticScore:
 @dataclass
 class GeometricScore:
     polygon_density: float     # normalised face count
-    mesh_node_count: float     # normalised count of mesh geometries
     node_hierarchy_depth: float  # normalised scene graph depth + node count
     uv_coverage: float         # fraction of faces with UV maps
     material_diversity: float  # normalised material count
@@ -96,10 +95,10 @@ class GeometricScore:
 class CompositeScore:
     semantic: SemanticScore
     geometric: GeometricScore
-    final_score: float         # 0.7 * semantic + 0.3 * geometric
+    final_score: float         # 0.5 * semantic + 0.5 * geometric
     is_labelled: bool          # whether model has meaningful named nodes
     node_names: list           # extracted scene-graph node names (empty if unlabelled)
-    decision: str              # USE / REFETCH / CACHE / DISCARD
+    decision: str              # SEGMENT_MESH / RENAME / USE / PENDING
     prompt: str
     model_path: str
 
@@ -434,26 +433,25 @@ def score_material_diversity(mesh_or_scene) -> float:
 def score_geometric(mesh_or_scene) -> GeometricScore:
     """
     Compute full geometric complexity score.
+    K-means segmentation now handles single-mesh decomposition,
+    so mesh_node_count is no longer needed as a scoring criterion.
     """
     polygon_density      = score_polygon_density(mesh_or_scene)
-    mesh_node_count      = score_mesh_node_count(mesh_or_scene)
     node_hierarchy_depth = score_node_hierarchy(mesh_or_scene)
     uv_coverage          = score_uv_coverage(mesh_or_scene)
     material_diversity   = score_material_diversity(mesh_or_scene)
 
     combined = round(
-        (0.35 * polygon_density) +
-        (0.20 * mesh_node_count) +
+        (0.45 * polygon_density) +
         (0.20 * node_hierarchy_depth) +
         (0.15 * uv_coverage) +
-        (0.10 * material_diversity),
+        (0.20 * material_diversity),
         4
     )
 
     print(f"[Geometric] Combined={combined:.4f}")
     return GeometricScore(
         polygon_density=polygon_density,
-        mesh_node_count=mesh_node_count,
         node_hierarchy_depth=node_hierarchy_depth,
         uv_coverage=uv_coverage,
         material_diversity=material_diversity,
@@ -498,43 +496,86 @@ def check_if_labelled(mesh_or_scene) -> tuple:
 
 
 # ─────────────────────────────────────────────
+# 4. Label Quality Check via LLM
+# ─────────────────────────────────────────────
+
+def check_labels_with_llm(node_names: list, prompt: str) -> bool:
+    """
+    Uses LLM to verify if node labels are well-defined and semantically correct.
+    Returns True if labels are meaningful and match the prompt intent,
+    False if they appear generic or poorly-defined.
+    """
+    import os
+    from groq import Groq
+    
+    if not node_names or len(node_names) == 0:
+        return False
+    
+    try:
+        client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+        
+        node_list = ", ".join(node_names)
+        check_prompt = f"""Given these model node labels: {node_list}
+        
+And the user intent: \"{prompt}\"
+
+Are these labels semantically meaningful, anatomically correct, and well-defined for this model type? Answer with only 'yes' or 'no'."""
+        
+        response = client.messages.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": check_prompt}],
+            max_tokens=10
+        )
+        answer = response.choices[0].message.content.strip().lower()
+        result = "yes" in answer
+        print(f"[LLM Label Check] Nodes={node_list[:50]}... → {'well-defined' if result else 'poorly-defined'}")
+        return result
+    except Exception as e:
+        logger.error(f"[LLM Label Check] Failed: {e}. Defaulting to False (poorly-defined).")
+        return False
+
+
+# ─────────────────────────────────────────────
 # 4. Decision Gate
 # ─────────────────────────────────────────────
 
-def make_decision(final_score: float, is_labelled: bool) -> str:
+def make_decision(final_score: float, node_count: int, node_names: list, prompt: str) -> str:
     """
-    Returns decision string based on composite score and label status.
+    Returns decision string based on composite score and node structure.
 
-    Decision logic (thresholds configurable via environment):
-    1. Labelled + score > THRESHOLD_LABELLED (default 0.60)  → USE
-       Model is correct AND has named nodes. Use directly for rendering
-       and spatial conversation. No Blender needed.
+    Decision logic:
+    1. Score ≥ 0.5 + Single node
+       → SEGMENT_MESH: Segment the mesh, then mesh_renamer creates semantic names (ready to use)
 
-    2. Labelled + score ≤ THRESHOLD_LABELLED → REFETCH
-       Model has labels but is the wrong object — retrieval fetched
-       something irrelevant. Refetch with refined query. Do not generate
-       because the problem is retrieval, not model availability.
+    2. Score ≥ 0.5 + Multiple nodes + Well-defined labels
+       → USE: Labels are semantically meaningful. Use directly.
 
-    3. Unlabelled + score > THRESHOLD_UNLABELLED (default 0.70) → CACHE
-       Model is the right object, very high quality, but has no named nodes.
-       Cache it for rendering. Trigger Blender MCP in background to generate
-       a labelled version for spatial conversation.
+    3. Score ≥ 0.5 + Multiple nodes + Poorly-defined labels
+       → RENAME: Call mesh_renamer to redefine labels.
 
-    4. Unlabelled + score ≤ THRESHOLD_UNLABELLED → DISCARD
-       Model is either wrong object or low quality and has no labels.
-       Not worth caching. Discard and trigger Blender MCP for full
-       procedural generation from structured intent.
+    4. Score < 0.5
+       → PENDING: User-defined handling (to be implemented)
     """
-    if is_labelled:
-        if final_score > THRESHOLD_LABELLED:
-            return "USE"     # Perfect: good model with labels
+    if final_score >= 0.5:
+        # Single node case: segment and rename, ready to use
+        if node_count <= 1:
+            print(f"[Decision] Single node, score {final_score:.4f} ≥ 0.5 → SEGMENT_MESH")
+            return "SEGMENT_MESH"
+        
+        # Multiple nodes case: check label quality with LLM
         else:
-            return "REFETCH"  # Wrong object, try better search
+            labels_well_defined = check_labels_with_llm(node_names, prompt)
+            if labels_well_defined:
+                print(f"[Decision] Multiple nodes with well-defined labels, score {final_score:.4f} ≥ 0.5 → USE")
+                return "USE"
+            else:
+                print(f"[Decision] Multiple nodes with poorly-defined labels, score {final_score:.4f} ≥ 0.5 → RENAME")
+                return "RENAME"
+    
     else:
-        if final_score > THRESHOLD_UNLABELLED:
-            return "CACHE"    # Good model, needs labeling
-        else:
-            return "DISCARD"  # Poor quality, generate from scratch
+        # Score < 0.5: user to define handling
+        print(f"[Decision] Score {final_score:.4f} < 0.5 → PENDING")
+        return "PENDING"
 
 
 # ─────────────────────────────────────────────
@@ -573,6 +614,15 @@ def score_model(
     # Check if model has labels — returns (bool, list[str])
     is_labelled, node_names = check_if_labelled(loaded)
     
+    # Count nodes: 1 for single Trimesh, count geometries for Scene
+    if isinstance(loaded, trimesh.Trimesh):
+        node_count = 1
+    elif isinstance(loaded, Scene):
+        node_count = len([g for g in loaded.geometry.values()
+                         if isinstance(g, trimesh.Trimesh)])
+    else:
+        node_count = 0
+    
     # Score
     semantic  = score_semantic(prompt, loaded, metadata)
     geometric = score_geometric(loaded)
@@ -582,12 +632,13 @@ def score_model(
         (SEMANTIC_WEIGHT * semantic.combined) + (GEOMETRIC_WEIGHT * geometric.combined),
         4
     )
-    decision = make_decision(final_score, is_labelled)
+    decision = make_decision(final_score, node_count, node_names, prompt)
 
     logger.info(f"\n{'='*60}")
     logger.info(f"[Result] Semantic  : {semantic.combined:.4f} (weight: {SEMANTIC_WEIGHT:.2f})")
     logger.info(f"[Result] Geometric : {geometric.combined:.4f} (weight: {GEOMETRIC_WEIGHT:.2f})")
-    logger.info(f"[Result] Labelled  : {is_labelled} ({len(node_names)} nodes)")
+    logger.info(f"[Result] Node count: {node_count}")
+    logger.info(f"[Result] Labelled  : {is_labelled} ({len(node_names)} named nodes)")
     if node_names:
         logger.info(f"[Result] Node names: {node_names}")
     logger.info(f"[Result] FINAL     : {final_score:.4f} = {SEMANTIC_WEIGHT:.1f}×{semantic.combined:.4f} + {GEOMETRIC_WEIGHT:.1f}×{geometric.combined:.4f}")
