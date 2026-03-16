@@ -26,6 +26,7 @@ export default function ModelViewer({
       <SketchfabViewer
         embedUrl={model.embed_url ?? ""}
         title={model.title}
+        highlightLabel={highlightLabel}
       />
     );
   }
@@ -40,26 +41,113 @@ export default function ModelViewer({
 function SketchfabViewer({
   embedUrl,
   title,
+  highlightLabel,
 }: {
   embedUrl: string;
   title: string;
+  highlightLabel?: string | null;
 }) {
   const [loaded, setLoaded] = useState(false);
+  const iframeRef = useRef<HTMLIFrameElement>(null);
+  const apiRef = useRef<any>(null);
+  const nodeMapRef = useRef<Record<string, number>>({});
+
+  // Extract UID from embed URL e.g. /models/{uid}/embed
+  const uid = embedUrl.match(/models\/([a-f0-9]+)/)?.[1] ?? "";
+
+  useEffect(() => {
+    if (!uid || !iframeRef.current) return;
+
+    // Load Sketchfab API script once
+    const existing = document.querySelector('script[data-sketchfab-api]');
+    const initViewer = () => {
+      const SF = (window as any).Sketchfab;
+      if (!SF || !iframeRef.current) return;
+      const client = new SF(iframeRef.current);
+      client.init(uid, {
+        success: (api: any) => {
+          apiRef.current = api;
+          api.start();
+          api.addEventListener("viewerready", () => {
+            setLoaded(true);
+            api.getNodeMap((_err: any, nodes: any) => {
+              if (_err || !nodes) return;
+              const map: Record<string, number> = {};
+              Object.values(nodes).forEach((node: any) => {
+                if (node.name) map[node.name.toLowerCase()] = node.instanceID;
+              });
+              nodeMapRef.current = map;
+            });
+          });
+        },
+        error: () => console.warn("[Sketchfab] Viewer init failed"),
+      });
+    };
+
+    if (existing) {
+      initViewer();
+    } else {
+      const s = document.createElement("script");
+      s.src = "https://static.sketchfab.com/api/sketchfab-viewer-1.12.1.js";
+      s.setAttribute("data-sketchfab-api", "1");
+      s.onload = initViewer;
+      document.head.appendChild(s);
+    }
+  }, [uid]);
+
+  // Highlight / unhighlight when label changes
+  useEffect(() => {
+    const api = apiRef.current;
+    if (!api) return;
+
+    api.getNodeMap((_err: any, nodes: any) => {
+      if (_err || !nodes) return;
+
+      // Show all first
+      Object.values(nodes).forEach((node: any) => {
+        if (node.type === "MatrixTransform") api.show(node.instanceID);
+      });
+
+      if (!highlightLabel) return;
+
+      const needle = highlightLabel.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+      let bestId: number | null = null;
+      let bestScore = -1;
+
+      Object.entries(nodeMapRef.current).forEach(([name, id]) => {
+        let score = 0;
+        if (name === needle) score = 100;
+        else if (name.includes(needle) || needle.includes(name)) score = 80;
+        else {
+          const overlap = needle.split(" ").filter(t => t && name.includes(t)).length;
+          score = overlap * 20;
+        }
+        if (score > bestScore) { bestScore = score; bestId = id; }
+      });
+
+      if (bestId === null || bestScore < 20) return;
+
+      // Hide everything except match
+      Object.values(nodes).forEach((node: any) => {
+        if (node.type === "MatrixTransform" && node.instanceID !== bestId) {
+          api.hide(node.instanceID);
+        }
+      });
+      api.focusOnNode(bestId);
+    });
+  }, [highlightLabel]);
 
   return (
-    <div
-      className="relative w-full h-full bg-obsidian overflow-hidden"
-      data-testid="sketchfab-viewer"
-    >
+    <div className="relative w-full h-full bg-obsidian overflow-hidden" data-testid="sketchfab-viewer">
       {!loaded && <ViewerLoader label="Initializing Sketchfab Renderer" />}
       <iframe
-        src={embedUrl}
+        ref={iframeRef}
+        src=""
+        id="api-frame"
         title={title}
-        frameBorder="0"
         allow="autoplay; fullscreen; xr-spatial-tracking"
         allowFullScreen
         className="w-full h-full"
-        onLoad={() => setLoaded(true)}
       />
       <CornerMarkers />
     </div>
@@ -255,7 +343,6 @@ function GltfViewer({ src, highlightLabel }: { src: string; highlightLabel: stri
     });
     renderer.setSize(width, height);
     renderer.setPixelRatio(window.devicePixelRatio);
-    renderer.vr.enabled = false;
     renderer.toneMappingExposure = 1.2;
     container.appendChild(renderer.domElement);
 
@@ -328,11 +415,13 @@ function GltfViewer({ src, highlightLabel }: { src: string; highlightLabel: stri
                 if (Array.isArray(mesh.material)) {
                   mesh.material = mesh.material.map((material) => {
                     const cloned = material.clone();
+                    (cloned as THREE.MeshStandardMaterial).vertexColors = true;
                     rememberDefaults(cloned);
                     return cloned;
                   });
                 } else {
                   mesh.material = mesh.material.clone();
+                  (mesh.material as THREE.MeshStandardMaterial).vertexColors = true;
                   rememberDefaults(mesh.material);
                 }
                 meshes.push(mesh);

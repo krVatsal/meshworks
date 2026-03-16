@@ -851,7 +851,7 @@ async def search_models(request: SearchRequest, http_request: Request):
                         })
                         logger.info(f"  📦 Node names ({len(score_result.node_names)}): {score_result.node_names}")
                     
-                    elif score_result.decision == "RENAME" and not score_result.is_labelled:
+                    elif score_result.decision == "RENAME":
                         # Multiple nodes with poorly-defined labels: fix with renamer
                         logger.info(f"  ⚠️  RENAME: Score {score_result.final_score:.4f} ≥ 0.5, poorly-defined labels")
                         logger.info(f"     → Labels need semantic refinement via mesh_renamer...")
