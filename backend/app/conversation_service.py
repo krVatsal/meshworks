@@ -85,7 +85,7 @@ async def handle_model_chat(request: ChatRequest, db, groq_client, logger) -> Ch
     # Extract node names from primary model only, not all candidates
     primary_result = next(
         (r for r in record.get("scored_results", [])
-         if r.get("model_id") == primary.get("id")),
+         if r.get("model", {}).get("id") == primary.get("id")),
         None,
     )
     node_names = primary_result.get("node_names", []) if primary_result else []
