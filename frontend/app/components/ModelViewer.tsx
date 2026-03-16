@@ -112,6 +112,9 @@ function GltfViewer({ src, highlightLabel }: { src: string; highlightLabel: stri
   );
   const [outlineColor] = useState(new THREE.Color(0x00f0ff));
   const outlineLayerRef = useRef<THREE.Scene | null>(null);
+  const materialDefaultsRef = useRef<Map<string, any>>(new Map());
+  const meshesRef = useRef<THREE.Mesh[]>([]);
+  const highlightLabelRef = useRef<string | null>(highlightLabel);
 
   const getMeshMaterials = (mesh: THREE.Mesh): THREE.Material[] => {
     const material = mesh.material;

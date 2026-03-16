@@ -82,12 +82,16 @@ async def handle_model_chat(request: ChatRequest, db, groq_client, logger) -> Ch
     if not isinstance(tags, list):
         tags = [str(tags)]
 
-    # Extract node names from primary model only, not all candidates
+    # Extract node names from primary model — match by URL since ModelInfo has no id field
+    primary_url = primary.get("url") or primary.get("embed_url")
     primary_result = next(
         (r for r in record.get("scored_results", [])
-         if r.get("model", {}).get("id") == primary.get("id")),
+         if (r.get("model", {}).get("url") or r.get("model", {}).get("embed_url")) == primary_url),
         None,
     )
+    # Fallback: if URL match fails (e.g. single result), use first scored entry
+    if primary_result is None and record.get("scored_results"):
+        primary_result = record["scored_results"][0]
     node_names = primary_result.get("node_names", []) if primary_result else []
 
     original_prompt = record.get("original_prompt", "")
@@ -110,7 +114,7 @@ async def handle_model_chat(request: ChatRequest, db, groq_client, logger) -> Ch
     _, history = _chat_histories[conversation_id]
 
     system_prompt = (
-        "You are an intelligent assistant for a 3D medical/anatomical model viewer. "
+        "You are an intelligent assistant for a 3D model viewer. "
         "For each user question, you MUST provide: "
         "1) A brief answer, "
         "2) The exact name of the relevant anatomical structure/segment, "
@@ -134,6 +138,7 @@ async def handle_model_chat(request: ChatRequest, db, groq_client, logger) -> Ch
     ]
 
     def _call_chat():
+        print(messages)
         return groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=messages,
@@ -146,6 +151,7 @@ async def handle_model_chat(request: ChatRequest, db, groq_client, logger) -> Ch
         loop = asyncio.get_event_loop()
         completion = await loop.run_in_executor(None, _call_chat)
         content = completion.choices[0].message.content or "{}"
+        print(completion.choices[0])
         payload = json.loads(content)
     except Exception as exc:
         logger.error("Model chat error: %s", exc, exc_info=True)
