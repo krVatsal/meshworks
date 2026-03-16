@@ -98,6 +98,7 @@ class CompositeScore:
     geometric: GeometricScore
     final_score: float         # 0.7 * semantic + 0.3 * geometric
     is_labelled: bool          # whether model has meaningful named nodes
+    node_names: list           # extracted scene-graph node names (empty if unlabelled)
     decision: str              # USE / REFETCH / CACHE / DISCARD
     prompt: str
     model_path: str
@@ -464,17 +465,17 @@ def score_geometric(mesh_or_scene) -> GeometricScore:
 # 3. Label Detection
 # ─────────────────────────────────────────────
 
-def check_if_labelled(mesh_or_scene) -> bool:
+def check_if_labelled(mesh_or_scene) -> tuple:
     """
     Determine if a model has meaningful labels (named nodes).
-    Returns True if the scene graph has multiple distinct named nodes.
+    Returns (is_labelled: bool, node_names: list[str]).
     """
     if isinstance(mesh_or_scene, trimesh.Trimesh):
         # Single mesh with no hierarchy
-        return False
+        return False, []
     
     if not isinstance(mesh_or_scene, Scene):
-        return False
+        return False, []
     
     graph = mesh_or_scene.graph
     
@@ -493,7 +494,7 @@ def check_if_labelled(mesh_or_scene) -> bool:
     print(f"[Label Check] Found {len(node_names)} meaningful node names: {node_names[:5]}")
     print(f"[Label Check] Model is {'LABELLED' if is_labelled else 'UNLABELLED'}")
     
-    return is_labelled
+    return is_labelled, node_names
 
 
 # ─────────────────────────────────────────────
@@ -569,8 +570,8 @@ def score_model(
         raise RuntimeError(f"Failed to load model at {model_path}: {e}")
     logger.info(f"[Loader] Loaded successfully → type={type(loaded).__name__}")
 
-    # Check if model has labels
-    is_labelled = check_if_labelled(loaded)
+    # Check if model has labels — returns (bool, list[str])
+    is_labelled, node_names = check_if_labelled(loaded)
     
     # Score
     semantic  = score_semantic(prompt, loaded, metadata)
@@ -586,7 +587,9 @@ def score_model(
     logger.info(f"\n{'='*60}")
     logger.info(f"[Result] Semantic  : {semantic.combined:.4f} (weight: {SEMANTIC_WEIGHT:.2f})")
     logger.info(f"[Result] Geometric : {geometric.combined:.4f} (weight: {GEOMETRIC_WEIGHT:.2f})")
-    logger.info(f"[Result] Labelled  : {is_labelled}")
+    logger.info(f"[Result] Labelled  : {is_labelled} ({len(node_names)} nodes)")
+    if node_names:
+        logger.info(f"[Result] Node names: {node_names}")
     logger.info(f"[Result] FINAL     : {final_score:.4f} = {SEMANTIC_WEIGHT:.1f}×{semantic.combined:.4f} + {GEOMETRIC_WEIGHT:.1f}×{geometric.combined:.4f}")
     logger.info(f"[Result] DECISION  : {decision}")
     logger.info(f"{'='*60}\n")
@@ -596,6 +599,7 @@ def score_model(
         geometric=geometric,
         final_score=final_score,
         is_labelled=is_labelled,
+        node_names=node_names,
         decision=decision,
         prompt=prompt,
         model_path=model_path

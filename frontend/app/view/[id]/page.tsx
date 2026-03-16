@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import axios from "axios";
 import ModelViewer from "@/app/components/ModelViewer";
+import ChatPanel from "@/app/components/ChatPanel";
 import {
   ArrowLeft,
   ExternalLink,
@@ -16,6 +17,7 @@ import {
   Zap,
   Copy,
   Check,
+  MessageSquare,
 } from "lucide-react";
 
 const API = `${process.env.NEXT_PUBLIC_BACKEND_URL}/api`;
@@ -54,6 +56,8 @@ export default function ViewerPage() {
   const [error, setError] = useState<string | null>(null);
   const [activeModel, setActiveModel] = useState<ModelData | null>(null);
   const [copied, setCopied] = useState(false);
+  const [showChat, setShowChat] = useState(false);
+  const [highlightedLabel, setHighlightedLabel] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -84,6 +88,10 @@ export default function ViewerPage() {
     }
   };
 
+  useEffect(() => {
+    setHighlightedLabel(null);
+  }, [activeModel?.url, activeModel?.embed_url]);
+
   if (loading) return <ViewerSkeleton />;
   if (error)
     return (
@@ -113,7 +121,7 @@ export default function ViewerPage() {
     >
       {/* 3D Viewer */}
       <div className="flex-1 relative bg-obsidian border-r border-white/5 min-h-[50vh] lg:min-h-0">
-        <ModelViewer model={activeModel} />
+        <ModelViewer model={activeModel} highlightLabel={highlightedLabel} />
 
         {/* Back button overlay */}
         <button
@@ -143,6 +151,21 @@ export default function ViewerPage() {
 
       {/* Info Panel */}
       <div className="w-full lg:w-80 xl:w-96 flex flex-col border-t lg:border-t-0 border-white/5 bg-black/40 backdrop-blur-sm overflow-y-auto">
+        {/* Chat toggle button */}
+        <div className="px-6 pt-4 pb-0">
+          <button
+            onClick={() => setShowChat((v) => !v)}
+            className={`w-full flex items-center justify-center gap-2 py-2 border font-mono text-[10px] tracking-widest transition-colors duration-200 ${
+              showChat
+                ? "border-cyber/60 bg-cyber/10 text-cyber"
+                : "border-white/10 text-slate-500 hover:border-cyber/30 hover:text-cyber/70"
+            }`}
+          >
+            <MessageSquare size={11} />
+            {showChat ? "CLOSE CHAT" : "CHAT ABOUT MODEL"}
+          </button>
+        </div>
+
         {/* Prompt */}
         <div className="p-6 border-b border-white/5">
           <div className="flex items-center justify-between mb-3">
@@ -313,6 +336,17 @@ export default function ViewerPage() {
           </div>
         )}
       </div>
+
+      {/* Chat Panel */}
+      {showChat && (
+        <div className="w-full lg:w-80 xl:w-96 flex flex-col border-t lg:border-t-0 lg:border-l border-white/5 bg-black/40 backdrop-blur-sm p-4">
+          <ChatPanel
+            searchId={id}
+            modelTitle={activeModel?.title ?? data?.original_prompt ?? "3D Model"}
+            onLabelSelect={setHighlightedLabel}
+          />
+        </div>
+      )}
     </div>
   );
 }

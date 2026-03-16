@@ -34,6 +34,11 @@ from app.sketchfab_fetcher import (
     FetchResult,
     SketchfabMetadata
 )
+from app.conversation_service import (
+    ChatRequest,
+    ChatResponse,
+    handle_model_chat,
+)
 
 ROOT_DIR = Path(__file__).parent.parent  # backend/
 load_dotenv(ROOT_DIR / '.env')
@@ -458,9 +463,12 @@ async def search_models(request: SearchRequest):
                             "score": score_result.final_score,
                             "decision": score_result.decision,
                             "is_labelled": score_result.is_labelled,
+                            "node_names": score_result.node_names,
                             "semantic_score": score_result.semantic.combined,
                             "geometric_score": score_result.geometric.combined,
                         })
+                        if score_result.node_names:
+                            logger.info(f"  📦 Node names ({len(score_result.node_names)}): {score_result.node_names}")
                         
                         # TODO: If CACHE, trigger Blender MCP in background for labeling
                         if score_result.decision == "CACHE":
@@ -593,6 +601,7 @@ async def search_models(request: SearchRequest):
                     "score": item["score"],
                     "decision": item["decision"],
                     "is_labelled": item["is_labelled"],
+                    "node_names": item.get("node_names", []),
                     "semantic_score": item["semantic_score"],
                     "geometric_score": item["geometric_score"],
                 }
@@ -648,6 +657,16 @@ async def delete_history_item(search_id: str):
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Search not found")
     return {"message": "Deleted"}
+
+
+@api_router.post("/chat", response_model=ChatResponse)
+async def model_chat(request: ChatRequest):
+    return await handle_model_chat(
+        request=request,
+        db=db,
+        groq_client=groq_client,
+        logger=logger,
+    )
 
 
 @api_router.get("/")
