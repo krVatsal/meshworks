@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone, timedelta
 from groq import Groq
 from tavily import TavilyClient
+import sys
 import os
 import logging
 import re
@@ -73,6 +74,55 @@ APP_DIR    = Path(__file__).parent          # …/app/
 INPUT_DIR  = APP_DIR / "input"
 OUTPUT_DIR = APP_DIR / "output"
 
+def _rewrite_glb_with_names(data: bytes, names_dict: dict) -> bytes:
+    """Rewrite GLB JSON chunk to rename mesh nodes and their referencing nodes."""
+    if len(data) < 20 or data[0:4] != b"glTF":
+        raise ValueError("Not a valid GLB")
+
+    offset = 12
+    json_start = json_end = json_chunk_start = None
+    while offset + 8 <= len(data):
+        chunk_length = int.from_bytes(data[offset:offset+4], "little")
+        chunk_type   = int.from_bytes(data[offset+4:offset+8], "little")
+        data_start   = offset + 8
+        data_end     = data_start + chunk_length
+        if chunk_type == 0x4E4F534A:  # JSON chunk
+            json_chunk_start = offset
+            json_start = data_start
+            json_end   = data_end
+            break
+        offset = data_end
+
+    if json_start is None:
+        raise ValueError("No JSON chunk found")
+
+    gltf = json.loads(data[json_start:json_end].decode("utf-8"))
+
+    for idx_str, new_name in names_dict.items():
+        try:
+            idx = int(idx_str)
+        except ValueError:
+            continue
+        meshes = gltf.get("meshes") or []
+        if 0 <= idx < len(meshes):
+            meshes[idx]["name"] = new_name
+
+    for node in (gltf.get("nodes") or []):
+        mesh_idx = node.get("mesh")
+        if isinstance(mesh_idx, int) and str(mesh_idx) in names_dict:
+            node["name"] = names_dict[str(mesh_idx)]
+
+    new_json = json.dumps(gltf, separators=(",", ":")).encode("utf-8")
+    pad = (4 - len(new_json) % 4) % 4
+    new_json += b" " * pad
+
+    new_chunk  = len(new_json).to_bytes(4, "little") + (0x4E4F534A).to_bytes(4, "little") + new_json
+    rest       = data[json_chunk_start + 8 + (json_end - json_start):]
+    new_total  = 12 + len(new_chunk) + len(rest)
+    header     = b"glTF" + (2).to_bytes(4, "little") + new_total.to_bytes(4, "little")
+    return header + new_chunk + rest
+
+
 async def rename_segmented_model(segmented_path: str, hint: str = "") -> tuple[Optional[str], list[str]]:
     """
     Rename segments in a segmented GLB to semantic names using LLM.
@@ -115,13 +165,17 @@ async def rename_segmented_model(segmented_path: str, hint: str = "") -> tuple[O
         
         logger.info(f"[rename] Generated semantic names: {semantic_names}")
         
-        # For now, return the original segmented path since mesh renaming
-        # updates the GLB in place. In a production system, you'd reconstruct
-        # the GLB with the new node names.
-        # 
-        # TODO: Implement GLB rewriting with new node names
-        logger.info(f"[rename] ✅ Semantic naming complete (node update pending)")
-        return segmented_path, semantic_names
+        # Rewrite the GLB file with new node names
+        try:
+            rewritten = _rewrite_glb_with_names(glb_data, names_dict)
+            out_path = OUTPUT_DIR / segmented_file.name
+            with open(out_path, "wb") as f:
+                f.write(rewritten)
+            logger.info(f"[rename] ✅ GLB rewritten with semantic names -> {out_path}")
+            return str(out_path), semantic_names
+        except Exception as e:
+            logger.error(f"[rename] GLB rewrite failed: {e}", exc_info=True)
+            return segmented_path, semantic_names  # partial success — names generated but file unchanged
         
     except Exception as e:
         logger.error(f"[rename] Failed to rename segmented model: {e}", exc_info=True)
@@ -146,28 +200,33 @@ async def segment_model(local_path: str) -> Optional[str]:
     filename = src.name
     dst      = INPUT_DIR / filename
 
-    shutil.copy2(src, dst)
+    if src.resolve() != dst.resolve():
+        shutil.copy2(src, dst)
     logger.info(f"[segment] Copied {filename} -> {dst}")
 
-    script = APP_DIR / "segment_glb.py"
+    script = APP_DIR / "segment_mesh.py"
     if not script.exists():
         logger.error(f"[segment] segment_glb.py not found at {script}")
         return None
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "python", str(script), filename,
-            "--max-segments", "20",
-            "--strategy", "auto",
-            cwd=str(APP_DIR),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        stdout, _ = await proc.communicate()
-        logger.info(f"[segment] Output:\n{stdout.decode(errors='replace')}")
+        import subprocess
+        def _run():
+            return subprocess.run(
+                [sys.executable, str(script), filename,
+                 "--max-segments", "20",
+                 "--strategy", "auto"],
+                cwd=str(APP_DIR),
+                capture_output=True,
+                text=True
+            )
+        loop = asyncio.get_event_loop()
+        proc = await loop.run_in_executor(None, _run)
+        log_output = proc.stdout + proc.stderr
+        logger.info(f"[segment] Output:\n{log_output}")
 
         if proc.returncode != 0:
-            logger.error(f"[segment] segment_glb.py exited with code {proc.returncode}")
+            logger.error(f"[segment] segment_mesh.py exited with code {proc.returncode}")
             return None
 
         out_path = OUTPUT_DIR / filename
@@ -582,16 +641,17 @@ async def search_models(request: SearchRequest):
                             logger.info("     [rename] Applying semantic naming to segments ...")
                             renamed_path, semantic_names = await rename_segmented_model(
                                 segmented_path, 
-                                hint=original_prompt or "anatomical structure"
+                                hint=", ".join(attributes.keywords) if attributes.keywords else prompt
                             )
                             if renamed_path:
                                 logger.info(f"     [rename] ✅ Segments renamed: {semantic_names}")
                                 final_path = renamed_path
                                 # Update node_names with semantic names for conversation service
-                                score_result.node_names = semantic_names
+
                             else:
                                 logger.warning("     [rename] ⚠️  Renaming failed, using original segments")
                                 final_path = segmented_path
+                                semantic_names = []
                             
                             model = ModelInfo(
                                 **{**model.model_dump(),
@@ -604,7 +664,7 @@ async def search_models(request: SearchRequest):
                                 "score": score_result.final_score,
                                 "decision": score_result.decision,
                                 "is_labelled": True,  # Now has semantic node names
-                                "node_names": score_result.node_names,
+                                "node_names": semantic_names,
                                 "semantic_score": score_result.semantic.combined,
                                 "geometric_score": score_result.geometric.combined,
                             })
@@ -628,7 +688,7 @@ async def search_models(request: SearchRequest):
                         })
                         logger.info(f"  📦 Node names ({len(score_result.node_names)}): {score_result.node_names}")
                     
-                    elif score_result.decision == "RENAME":
+                    elif score_result.decision == "RENAME" and not score_result.is_labelled:
                         # Multiple nodes with poorly-defined labels: fix with renamer
                         logger.info(f"  ⚠️  RENAME: Score {score_result.final_score:.4f} ≥ 0.5, poorly-defined labels")
                         logger.info(f"     → Labels need semantic refinement via mesh_renamer...")
@@ -637,7 +697,7 @@ async def search_models(request: SearchRequest):
                         logger.info("     [rename] Refining node labels with semantic naming...")
                         renamed_path, semantic_names = await rename_segmented_model(
                             str(fetch_result.local_path),
-                            hint=original_prompt or "anatomical structure"
+                            hint=prompt or "anatomical structure"
                         )
                         
                         if renamed_path:
@@ -663,7 +723,7 @@ async def search_models(request: SearchRequest):
                             "semantic_score": score_result.semantic.combined,
                             "geometric_score": score_result.geometric.combined,
                         })
-                        logger.info(f"  📦 Node names ({len(score_result.node_names)}): {score_result.node_names}")
+                        logger.info(f"  📦 Node names ({len(semantic_names)}): {semantic_names}")
                     
                     elif score_result.decision == "PENDING":
                         # Score < 0.5: awaiting user definition
@@ -701,7 +761,7 @@ async def search_models(request: SearchRequest):
         logger.info(f"  {'-'*40} {'-'*8} {'-'*7} {'-'*7} {'-'*10} {'-'*10}")
         
         for result in all_scoring_results:
-            decision_symbol = "✅" if result["decision"] in ["USE", "CACHE"] else "❌"
+            decision_symbol = "✅" if result["decision"] in ["USE", "SEGMENT_MESH", "RENAME"] else "❌"
             labelled_str = "Yes" if result["labelled"] else "No"
             logger.info(
                 f"  {result['title']:<40} {result['score']:.4f}   "

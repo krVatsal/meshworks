@@ -427,7 +427,7 @@ async def _chat_json(
             model=model,
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
-            max_tokens=max_tokens,
+            max_completion_tokens=max_tokens,
         )
 
     response = await loop.run_in_executor(None, _call)
