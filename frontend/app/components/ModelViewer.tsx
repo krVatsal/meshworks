@@ -308,8 +308,13 @@ function GltfViewer({ src, highlightLabel }: { src: string; highlightLabel: stri
           "three/examples/jsm/loaders/GLTFLoader.js"
         );
         const loader = new GLTFLoader();
+        // Resolve relative URLs against the frontend origin
+        const resolvedSrc = src.startsWith("/")
+          ? `${window.location.origin}${src}`
+          : src;
+
         loader.load(
-          src,
+          resolvedSrc,
           (gltf) => {
             scene.add(gltf.scene);
             setStatus(null);

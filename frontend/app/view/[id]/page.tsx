@@ -18,6 +18,7 @@ import {
   Copy,
   Check,
   MessageSquare,
+  Download,
 } from "lucide-react";
 
 const API = `${process.env.NEXT_PUBLIC_BACKEND_URL}/api`;
@@ -29,6 +30,7 @@ interface ModelData {
   embed_url?: string;
   source_url: string;
   source_domain: string;
+  is_downloadable?: boolean;
 }
 
 interface SearchAttributes {
@@ -255,15 +257,29 @@ export default function ViewerPage() {
             <p className="font-mono text-[10px] text-slate-600 mb-3">
               {activeModel.source_domain}
             </p>
-            <a
-              href={activeModel.source_url}
-              target="_blank"
-              rel="noopener noreferrer"
-              data-testid="model-source-link"
-              className="flex items-center gap-2 text-cyber/60 hover:text-cyber font-mono text-[11px] tracking-widest transition-colors duration-200"
-            >
-              VIEW SOURCE <ExternalLink size={10} />
-            </a>
+
+            <div className="flex flex-col gap-2 mt-4">
+              <a
+                href={activeModel.source_url}
+                target="_blank"
+                rel="noopener noreferrer"
+                data-testid="model-source-link"
+                className="flex items-center justify-center gap-2 px-4 py-2 border border-cyber/30 text-cyber hover:bg-cyber/10 font-mono text-[11px] tracking-widest transition-colors duration-200"
+              >
+                VIEW SOURCE <ExternalLink size={12} />
+              </a>
+
+              {activeModel.url && (
+                <a
+                  href={`${API}/download?url=${encodeURIComponent(activeModel.url)}`}
+                  download
+                  data-testid="model-download-link"
+                  className="flex items-center justify-center gap-2 px-4 py-2 bg-cyber text-black hover:bg-cyber/80 font-mono text-[11px] tracking-widest transition-colors duration-200 font-semibold"
+                >
+                  DOWNLOAD 3D FILE <Download size={12} />
+                </a>
+              )}
+            </div>
           </div>
         )}
 
@@ -286,11 +302,10 @@ export default function ViewerPage() {
                     key={i}
                     onClick={() => setActiveModel(m)}
                     data-testid={`model-candidate-${i}`}
-                    className={`w-full text-left p-3 border transition-colors duration-200 ${
-                      isActive
-                        ? "border-cyber/50 bg-cyber/5"
-                        : "border-white/5 bg-white/2 hover:border-white/15 hover:bg-white/5"
-                    }`}
+                    className={`w-full text-left p-3 border transition-colors duration-200 ${isActive
+                      ? "border-cyber/50 bg-cyber/5"
+                      : "border-white/5 bg-white/2 hover:border-white/15 hover:bg-white/5"
+                      }`}
                   >
                     <div className="flex items-center justify-between gap-2 mb-1">
                       <span
