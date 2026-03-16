@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Query, UploadFile, File, Form, BackgroundTasks
+from fastapi import FastAPI, APIRouter, HTTPException, Query, UploadFile, File, Form, BackgroundTasks, Request
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -15,6 +15,7 @@ import json
 import asyncio
 import shutil
 import uuid
+import mimetypes
 from pathlib import Path
 from dotenv import load_dotenv
 import httpx
@@ -314,6 +315,19 @@ class BatchScoreResponse(BaseModel):
     ranked_models: List[Dict[str, Any]]
     best_model: Optional[Dict[str, Any]]
 
+
+class MeshFromPromptRequest(BaseModel):
+    prompt: str
+
+
+class MeshFromPromptResponse(BaseModel):
+    prompt: str
+    selected_image_url: str
+    selected_image_bytes: int
+    output_filename: str
+    output_url: str
+    generator_endpoint: str
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _extract_domain(url: str) -> str:
@@ -502,10 +516,159 @@ async def search_models_with_tavily(attributes: SearchAttributes) -> List[ModelI
 
     return models
 
+
+def _extract_image_urls(search_result: Dict[str, Any]) -> List[str]:
+    urls: List[str] = []
+
+    images = search_result.get("images") or []
+    for image_entry in images:
+        if isinstance(image_entry, str) and image_entry.startswith("http"):
+            urls.append(image_entry)
+        elif isinstance(image_entry, dict):
+            candidate = image_entry.get("url") or image_entry.get("image_url")
+            if isinstance(candidate, str) and candidate.startswith("http"):
+                urls.append(candidate)
+
+    for item in search_result.get("results", []):
+        if not isinstance(item, dict):
+            continue
+        for key in ("image", "image_url", "thumbnail"):
+            candidate = item.get(key)
+            if isinstance(candidate, str) and candidate.startswith("http"):
+                urls.append(candidate)
+
+    deduped: List[str] = []
+    seen = set()
+    for url in urls:
+        if url not in seen:
+            seen.add(url)
+            deduped.append(url)
+    return deduped
+
+
+async def _download_high_quality_image_for_prompt(prompt: str) -> tuple[bytes, str, str]:
+    loop = asyncio.get_event_loop()
+
+    search_queries = [
+        f"{prompt} high quality 3d render 8k",
+        f"{prompt} high quality 3d model reference image",
+        f"{prompt} high resolution image",
+    ]
+
+    def _tavily_search(query: str) -> Dict[str, Any]:
+        return tavily_client.search(
+            query=query,
+            search_depth="advanced",
+            max_results=8,
+            include_answer=False,
+            include_images=True,
+        )
+
+    candidate_urls: List[str] = []
+    for query in search_queries:
+        try:
+            result = await loop.run_in_executor(None, _tavily_search, query)
+            extracted = _extract_image_urls(result)
+            candidate_urls.extend(extracted)
+            if extracted:
+                # Prefer 3D-biased queries first; stop early once candidates are found.
+                break
+        except Exception as exc:
+            logger.warning("Tavily image search failed for query '%s': %s", query, exc)
+
+    if not candidate_urls:
+        raise HTTPException(status_code=502, detail="No candidate images found via Tavily")
+
+    best_bytes: Optional[bytes] = None
+    best_url: Optional[str] = None
+    best_mime: str = "application/octet-stream"
+
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        for image_url in candidate_urls[:12]:
+            try:
+                resp = await client.get(image_url)
+                if resp.status_code != 200:
+                    continue
+
+                content_type = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+                if not content_type.startswith("image/"):
+                    continue
+
+                payload = resp.content
+                if len(payload) < 100_000:
+                    continue
+
+                if best_bytes is None or len(payload) > len(best_bytes):
+                    best_bytes = payload
+                    best_url = image_url
+                    best_mime = content_type
+            except Exception:
+                continue
+
+    if not best_bytes or not best_url:
+        raise HTTPException(status_code=502, detail="Could not download a suitable high-quality image")
+
+    return best_bytes, best_url, best_mime
+
+
+async def _generate_mesh_file_from_prompt(prompt: str) -> tuple[Path, str, int, str]:
+    """
+    Generate a GLB from prompt via the mesh generation API and persist it in OUTPUT_DIR.
+
+    Returns:
+        (output_path, selected_image_url, selected_image_bytes, generator_endpoint)
+    """
+    image_bytes, image_url, image_mime = await _download_high_quality_image_for_prompt(prompt)
+
+    mesh_api_url = os.environ.get("MESH_GENERATOR_URL", "http://98.70.40.74:8000/generate-mesh")
+    extension = mimetypes.guess_extension(image_mime) or ".jpg"
+    upload_name = f"source_{uuid.uuid4().hex}{extension}"
+
+    async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+        try:
+            response = await client.post(
+                mesh_api_url,
+                files={"file": (upload_name, image_bytes, image_mime)},
+            )
+        except Exception as exc:
+            logger.error("Mesh generation API request failed: %s", exc, exc_info=True)
+            raise HTTPException(status_code=502, detail="Mesh generation API is unreachable") from exc
+
+    if response.status_code != 200:
+        detail = response.text[:500]
+        raise HTTPException(
+            status_code=502,
+            detail=f"Mesh generation API failed with {response.status_code}: {detail}",
+        )
+
+    output_filename = f"model_{uuid.uuid4().hex}.glb"
+    output_path = OUTPUT_DIR / output_filename
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    async with aiofiles.open(output_path, "wb") as f:
+        await f.write(response.content)
+
+    return output_path, image_url, len(image_bytes), mesh_api_url
+
+
+async def _segment_and_rename_generated_model(glb_path: Path, hint: str) -> tuple[Path, list[str]]:
+    """Apply the same segment -> rename flow used for approved unlabelled models."""
+    segmented_path = await segment_model(str(glb_path))
+    if not segmented_path:
+        logger.warning("[fallback] Segmentation failed for generated mesh; using raw generated model")
+        return glb_path, []
+
+    renamed_path, semantic_names = await rename_segmented_model(segmented_path, hint=hint)
+    if renamed_path:
+        return Path(renamed_path), semantic_names
+
+    logger.warning("[fallback] Renaming failed for generated mesh; using segmented output")
+    return Path(segmented_path), []
+
 # ─── Routes ───────────────────────────────────────────────────────────────────
 
 @api_router.post("/search", response_model=SearchResponse)
-async def search_models(request: SearchRequest):
+async def search_models(request: SearchRequest, http_request: Request):
     prompt = request.prompt.strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="Prompt cannot be empty")
@@ -774,73 +937,47 @@ async def search_models(request: SearchRequest):
         logger.info(f"  RESULT: {len(scored_models)} APPROVED / {len(all_scoring_results)} EVALUATED")
         logger.info(f"{'='*90}\n")
         
-        # ─── FALLBACK STRATEGIES: Return unscored models or generate procedural ───
+        # ─── FALLBACK STRATEGY: Generate model if none approved (includes score < 0.5) ───
         if not approved_models:
-            logger.warning("⚠️  All models REJECTED by decision gates (REFETCH/DISCARD)")
-            
-            # Strategy 1: Return unscored Sketchfab models with embed URLs
-            unscored_sketchfab = [m for m in models[:5] if m.type == "sketchfab" and m.embed_url]
-            if unscored_sketchfab:
-                logger.info(f"📋 Returning {len(unscored_sketchfab)} unscored Sketchfab models (embed-only, no scoring)")
-                primary = unscored_sketchfab[0]
-                approved_models = unscored_sketchfab
-                status = "completed"
-            else:
-                # Strategy 2: Generate procedural model with Blender MCP
-                logger.info("🔧 Triggering Blender MCP for procedural generation...")
-                
-                try:
-                    # Connect to Blender MCP if not already connected
-                    if not blender_client.is_connected:
-                        logger.info("Connecting to Blender MCP server...")
-                        await blender_client.connect()
-                    
-                    # Generate model using Blender MCP
-                    blender_prompt = (
-                        f"Create a 3D model of: {prompt}. "
-                        f"Style: {attributes.style}. "
-                        f"Make it detailed and export as GLB."
-                    )
-                    
-                    conversation_id = str(uuid.uuid4())
-                    logger.info(f"[Blender] Sending prompt: {blender_prompt}")
-                    
-                    result = await blender_client.chat(
-                        user_message=blender_prompt,
-                        conversation_id=conversation_id,
-                    )
-                    
-                    glb_path = result.get("glb_path")
-                    
-                    if glb_path and Path(glb_path).exists():
-                        logger.info(f"✅ Blender generated model: {glb_path}")
+            logger.warning("⚠️  No approved model available. Triggering mesh-generation fallback.")
 
-                        # TODO: Segment the AI-generated model once Blender MCP
-                        # generation is fully implemented. Uncomment when ready:
-                        #
-                        #   segmented_path = await segment_model(glb_path)
-                        #   if segmented_path:
-                        #       glb_path = segmented_path
-                        
-                        # Create ModelInfo for the Blender-generated model
-                        primary = ModelInfo(
-                            type="glb",
-                            url=f"file://{glb_path}",
-                            title=f"Procedural: {prompt}",
-                            source_url="blender://procedural",
-                            source_domain="blender-mcp",
-                            description=f"Procedurally generated by Blender MCP",
-                            tags=attributes.keywords,
-                        )
-                        approved_models = [primary]
-                        status = "completed"
-                    else:
-                        logger.error("❌ Blender MCP failed to generate model")
-                        status = "no_model"
-                        
-                except Exception as e:
-                    logger.error(f"❌ Blender fallback failed: {e}", exc_info=True)
-                    status = "no_model"
+            try:
+                generated_path, image_url, image_bytes, generator_endpoint = await _generate_mesh_file_from_prompt(prompt)
+                logger.info(f"[fallback] Generated base mesh: {generated_path}")
+
+                rename_hint = ", ".join(attributes.keywords) if attributes.keywords else prompt
+                final_path, semantic_names = await _segment_and_rename_generated_model(generated_path, hint=rename_hint)
+
+                output_url = str(http_request.url_for("serve_output_file", filename=final_path.name))
+                primary = ModelInfo(
+                    type="glb",
+                    url=output_url,
+                    title=f"Generated: {prompt}",
+                    source_url=generator_endpoint,
+                    source_domain="mesh-generator",
+                    description=(
+                        f"Generated via fallback mesh API from image: {image_url} "
+                        f"({image_bytes} bytes), then segmented/renamed"
+                    ),
+                    tags=attributes.keywords,
+                )
+
+                approved_models = [primary]
+                scored_models.append(
+                    {
+                        "model": primary,
+                        "score": 0.0,
+                        "decision": "GENERATED_FALLBACK",
+                        "is_labelled": bool(semantic_names),
+                        "node_names": semantic_names,
+                        "semantic_score": 0.0,
+                        "geometric_score": 0.0,
+                    }
+                )
+                status = "completed"
+            except Exception as e:
+                logger.error(f"❌ Mesh-generation fallback failed: {e}", exc_info=True)
+                status = "no_model"
         else:
             status = "completed"
 
@@ -972,6 +1109,27 @@ async def mesh_rename(file: UploadFile = File(...), hint: str = Form(default="")
     except Exception as exc:
         logger.error("Mesh rename error: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@api_router.post("/generate-mesh-from-prompt", response_model=MeshFromPromptResponse)
+async def generate_mesh_from_prompt(request: MeshFromPromptRequest, http_request: Request):
+    prompt = request.prompt.strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Prompt cannot be empty")
+
+    generated_path, image_url, image_bytes, mesh_api_url = await _generate_mesh_file_from_prompt(prompt)
+    final_path, _ = await _segment_and_rename_generated_model(generated_path, hint=prompt)
+
+    output_url = str(http_request.url_for("serve_output_file", filename=final_path.name))
+
+    return MeshFromPromptResponse(
+        prompt=prompt,
+        selected_image_url=image_url,
+        selected_image_bytes=image_bytes,
+        output_filename=final_path.name,
+        output_url=output_url,
+        generator_endpoint=mesh_api_url,
+    )
 # ─── Model Scoring Routes ─────────────────────────────────────────────────────
 
 @api_router.post("/score", response_model=ModelScoreResponse)
