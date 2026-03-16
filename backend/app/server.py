@@ -568,13 +568,54 @@ async def search_models(request: SearchRequest):
                     })
                     
                     # Apply decision gates - only USE and CACHE models are shown
-                    if score_result.decision in ["USE", "CACHE"]:
-                        if score_result.decision == "USE":
-                            logger.info(f"  ✅ APPROVED (USE): Labelled + Score {score_result.final_score:.4f} > {THRESHOLD_LABELLED:.2f} threshold")
-                            logger.info(f"     → Model has named nodes and good quality. Ready for immediate use!")
-                        else:  # CACHE
-                            logger.info(f"  ✅ APPROVED (CACHE): Unlabelled + Score {score_result.final_score:.4f} > {THRESHOLD_UNLABELLED:.2f} threshold")
-                            logger.info(f"     → High quality but needs labeling. Will trigger Blender MCP for node naming.")
+                    # New decision gate logic: SEGMENT_MESH / USE / RENAME / PENDING
+                    if score_result.decision == "SEGMENT_MESH":
+                        # Single mesh: segment it, apply semantic naming, ready to use
+                        logger.info(f"  ✅ SEGMENT_MESH: Score {score_result.final_score:.4f} ≥ 0.5, single node")
+                        logger.info(f"     → Segmenting mesh and creating semantic names...")
+                        
+                        segmented_path = await segment_model(str(fetch_result.local_path))
+                        if segmented_path:
+                            logger.info(f"     [segment] ✅ Done: {segmented_path}")
+                            
+                            # Rename segments to semantic names using original prompt as hint
+                            logger.info("     [rename] Applying semantic naming to segments ...")
+                            renamed_path, semantic_names = await rename_segmented_model(
+                                segmented_path, 
+                                hint=original_prompt or "anatomical structure"
+                            )
+                            if renamed_path:
+                                logger.info(f"     [rename] ✅ Segments renamed: {semantic_names}")
+                                final_path = renamed_path
+                                # Update node_names with semantic names for conversation service
+                                score_result.node_names = semantic_names
+                            else:
+                                logger.warning("     [rename] ⚠️  Renaming failed, using original segments")
+                                final_path = segmented_path
+                            
+                            model = ModelInfo(
+                                **{**model.model_dump(),
+                                   "url": f"/api/output/{Path(final_path).name}",
+                                   "description": (model.description or "") + " [segmented + renamed]"}
+                            )
+                            
+                            scored_models.append({
+                                "model": model,
+                                "score": score_result.final_score,
+                                "decision": score_result.decision,
+                                "is_labelled": True,  # Now has semantic node names
+                                "node_names": score_result.node_names,
+                                "semantic_score": score_result.semantic.combined,
+                                "geometric_score": score_result.geometric.combined,
+                            })
+                            logger.info(f"  📦 Node names ({len(score_result.node_names)}): {score_result.node_names}")
+                        else:
+                            logger.warning("     [segment] ⚠️  Failed — skipping this model")
+                    
+                    elif score_result.decision == "USE":
+                        # Multiple nodes with well-defined labels: use directly
+                        logger.info(f"  ✅ USE: Score {score_result.final_score:.4f} ≥ 0.5, well-defined labels")
+                        logger.info(f"     → Model has semantic node names. Ready for immediate use!")
                         
                         scored_models.append({
                             "model": model,
@@ -585,51 +626,49 @@ async def search_models(request: SearchRequest):
                             "semantic_score": score_result.semantic.combined,
                             "geometric_score": score_result.geometric.combined,
                         })
-                        if score_result.node_names:
-                            logger.info(f"  📦 Node names ({len(score_result.node_names)}): {score_result.node_names}")
+                        logger.info(f"  📦 Node names ({len(score_result.node_names)}): {score_result.node_names}")
+                    
+                    elif score_result.decision == "RENAME":
+                        # Multiple nodes with poorly-defined labels: fix with renamer
+                        logger.info(f"  ⚠️  RENAME: Score {score_result.final_score:.4f} ≥ 0.5, poorly-defined labels")
+                        logger.info(f"     → Labels need semantic refinement via mesh_renamer...")
                         
-                        # Unlabelled single mesh → segment it to create named nodes
-                        if score_result.decision == "CACHE" and fetch_result.local_path:
-                            logger.info("     [segment] Single mesh — running segmentation ...")
-                            segmented_path = await segment_model(str(fetch_result.local_path))
-                            if segmented_path:
-                                logger.info(f"     [segment] ✅ Done: {segmented_path}")
-                                
-                                # Rename segments to semantic names using original prompt as hint
-                                logger.info("     [rename] Applying semantic naming to segments ...")
-                                renamed_path, semantic_names = await rename_segmented_model(
-                                    segmented_path, 
-                                    hint=original_prompt or "anatomical structure"
-                                )
-                                if renamed_path:
-                                    logger.info(f"     [rename] ✅ Segments renamed: {semantic_names}")
-                                    final_path = renamed_path
-                                    # Update node_names with semantic names for conversation service
-                                    score_result.node_names = semantic_names
-                                else:
-                                    logger.warning("     [rename] ⚠️  Renaming failed, using original segments")
-                                    final_path = segmented_path
-                                
-                                model = ModelInfo(
-                                    **{**model.model_dump(),
-                                       "url": f"/api/output/{Path(final_path).name}",
-                                       "description": (model.description or "") + " [segmented + renamed]"}
-                                )
-                                
-                                # Update scored_models entry with new node_names
-                                scored_models[-1]["node_names"] = score_result.node_names
-                            else:
-                                logger.warning("     [segment] ⚠️  Failed — using original model")
+                        # Call renamer to fix the labels
+                        logger.info("     [rename] Refining node labels with semantic naming...")
+                        renamed_path, semantic_names = await rename_segmented_model(
+                            str(fetch_result.local_path),
+                            hint=original_prompt or "anatomical structure"
+                        )
+                        
+                        if renamed_path:
+                            logger.info(f"     [rename] ✅ Labels refined: {semantic_names}")
+                            final_path = renamed_path
+                            score_result.node_names = semantic_names
+                            
+                            model = ModelInfo(
+                                **{**model.model_dump(),
+                                   "url": f"/api/output/{Path(final_path).name}",
+                                   "description": (model.description or "") + " [labels refined]"}
+                            )
+                        else:
+                            logger.warning("     [rename] ⚠️  Renaming failed, using original labels")
+                            final_path = str(fetch_result.local_path)
+                        
+                        scored_models.append({
+                            "model": model,
+                            "score": score_result.final_score,
+                            "decision": score_result.decision,
+                            "is_labelled": True,  # Now has refined labels
+                            "node_names": score_result.node_names,
+                            "semantic_score": score_result.semantic.combined,
+                            "geometric_score": score_result.geometric.combined,
+                        })
+                        logger.info(f"  📦 Node names ({len(score_result.node_names)}): {score_result.node_names}")
                     
-                    elif score_result.decision == "REFETCH":
-                        logger.info(f"  ❌ REJECTED (REFETCH): Labelled but Score {score_result.final_score:.4f} ≤ {THRESHOLD_LABELLED:.2f} threshold")
-                        logger.info(f"     → Model has labels but is the WRONG OBJECT (semantic mismatch)")
-                        logger.info(f"     → Search fetched something irrelevant. Need better query refinement.")
-                    
-                    elif score_result.decision == "DISCARD":
-                        logger.info(f"  ❌ REJECTED (DISCARD): Unlabelled and Score {score_result.final_score:.4f} ≤ {THRESHOLD_UNLABELLED:.2f} threshold")
-                        logger.info(f"     → Model is either wrong object OR too low quality")
-                        logger.info(f"     → Not worth caching. Will generate from scratch with Blender.")
+                    elif score_result.decision == "PENDING":
+                        # Score < 0.5: awaiting user definition
+                        logger.info(f"  ⏸️  PENDING: Score {score_result.final_score:.4f} < 0.5")
+                        logger.info(f"     → Score below threshold. Skipping for now (awaiting threshold definition).")
                     
                     logger.info(f"{'='*70}\n")
                 
