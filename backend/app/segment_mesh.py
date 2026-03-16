@@ -813,7 +813,7 @@ def main():
                    help="Global segment limit across the whole model. "
                         "The N largest segments are kept; all smaller ones are "
                         "merged into their closest (most-shared-edge) neighbour. "
-                        "Default: 20")
+                        "Default: 50")
     p.add_argument("--views",             type=int, default=16)
     p.add_argument("--img-size",          type=int, default=256)
     p.add_argument("--angle",             type=float, default=45.0)
