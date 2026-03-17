@@ -75,6 +75,17 @@ APP_DIR    = Path(__file__).parent          # …/app/
 INPUT_DIR  = APP_DIR / "input"
 OUTPUT_DIR = APP_DIR / "output"
 
+# copy to ouput helper
+def _copy_to_output(local_path: str) -> Optional[str]:
+    """Copy a downloaded model to app/output/ and return the output path."""
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    src = Path(local_path)
+    dst = OUTPUT_DIR / src.name
+    if src.resolve() != dst.resolve():
+        shutil.copy2(src, dst)
+    return str(dst)
+
+
 def _rewrite_glb_with_names(data: bytes, names_dict: dict) -> bytes:
     """Rewrite GLB JSON chunk to rename mesh nodes and their referencing nodes."""
     if len(data) < 20 or data[0:4] != b"glTF":
@@ -836,20 +847,28 @@ async def search_models(request: SearchRequest, http_request: Request):
                             logger.warning("     [segment] ⚠️  Failed — skipping this model")
                     
                     elif score_result.decision == "USE":
-                        # Multiple nodes with well-defined labels: use directly
                         logger.info(f"  ✅ USE: Score {score_result.final_score:.4f} ≥ 0.5, well-defined labels")
-                        logger.info(f"     → Model has semantic node names. Ready for immediate use!")
-                        
+                        logger.info(f"     → Copying to output for Three.js rendering ...")
+
+                        out_path = _copy_to_output(str(fetch_result.local_path))
+                        node_names = getattr(score_result, "node_names", []) or []
+
+                        model = ModelInfo(
+                                **{**model.model_dump(),
+                                   "type": "glb",
+                                   "url": f"/api/output/{Path(final_path).name}",
+                                   "description": (model.description or "") + " [segmented + renamed]"}
+                            )
                         scored_models.append({
                             "model": model,
                             "score": score_result.final_score,
                             "decision": score_result.decision,
                             "is_labelled": score_result.is_labelled,
-                            "node_names": score_result.node_names,
+                            "node_names": node_names,
                             "semantic_score": score_result.semantic.combined,
                             "geometric_score": score_result.geometric.combined,
                         })
-                        logger.info(f"  📦 Node names ({len(score_result.node_names)}): {score_result.node_names}")
+                        logger.info(f"  📦 Node names ({len(node_names)}): {node_names}")
                     
                     elif score_result.decision == "RENAME":
                         # Multiple nodes with poorly-defined labels: fix with renamer
@@ -866,16 +885,17 @@ async def search_models(request: SearchRequest, http_request: Request):
                         if renamed_path:
                             logger.info(f"     [rename] ✅ Labels refined: {semantic_names}")
                             final_path = renamed_path
-                            score_result.node_names = semantic_names
-                            
-                            model = ModelInfo(
-                                **{**model.model_dump(),
-                                   "url": f"/api/output/{Path(final_path).name}",
-                                   "description": (model.description or "") + " [labels refined]"}
-                            )
                         else:
-                            logger.warning("     [rename] ⚠️  Renaming failed, using original labels")
-                            final_path = str(fetch_result.local_path)
+                            logger.warning("     [rename] ⚠️  Renaming failed — copying original to output")
+                            final_path = _copy_to_output(str(fetch_result.local_path))
+                            semantic_names = getattr(score_result, "node_names", []) or []
+
+                        model = ModelInfo(
+                            **{**model.model_dump(),
+                               "type": "glb",
+                               "url": f"/api/output/{Path(final_path).name}",
+                               "description": (model.description or "") + " [labels refined]"}
+                        )
                         
                         scored_models.append({
                             "model": model,
