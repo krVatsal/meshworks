@@ -21,18 +21,20 @@ export default function ModelViewer({
     return <NoModelState />;
   }
 
-  if (model.type === "sketchfab") {
+  // All approved models are now served as GLB from /api/output/ — use Three.js
+  if (model.url) {
+    return <GltfViewer src={model.url} highlightLabel={highlightLabel ?? null} />;
+  }
+
+  // Fallback only: embed-only Sketchfab models that couldn't be downloaded
+  if (model.type === "sketchfab" && model.embed_url) {
     return (
       <SketchfabViewer
-        embedUrl={model.embed_url ?? ""}
+        embedUrl={model.embed_url}
         title={model.title}
         highlightLabel={highlightLabel}
       />
     );
-  }
-
-  if (model.type === "glb" || model.type === "gltf") {
-    return <GltfViewer src={model.url ?? ""} highlightLabel={highlightLabel ?? null} />;
   }
 
   return <NoModelState />;
@@ -390,8 +392,28 @@ function GltfViewer({ src, highlightLabel }: { src: string; highlightLabel: stri
     // Store lights for dynamic adjustment
     const lightsRef = { highlightLight, dirLight };
 
+    // Orbit controls — mouse drag to rotate, scroll to zoom, right-click to pan
+    let controls: any;
+    const loadControls = async () => {
+      try {
+        const { OrbitControls } = await import(
+          "three/examples/jsm/controls/OrbitControls.js"
+        );
+        controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.minDistance = 0.1;
+        controls.maxDistance = 1000;
+        controls.enablePan = true;
+      } catch {
+        console.warn("OrbitControls unavailable");
+      }
+    };
+    loadControls();
+
     // Load GLB
     let animId: number;
+
     const load = async () => {
       try {
         const { GLTFLoader } = await import(
@@ -408,6 +430,21 @@ function GltfViewer({ src, highlightLabel }: { src: string; highlightLabel: stri
           (gltf) => {
             scene.add(gltf.scene);
             setStatus(null);
+
+            // Center + fit camera to model bounds
+            const box = new THREE.Box3().setFromObject(gltf.scene);
+            const center = box.getCenter(new THREE.Vector3());
+            const size = box.getSize(new THREE.Vector3());
+            const maxDim = Math.max(size.x, size.y, size.z);
+            gltf.scene.position.sub(center);  // center at origin
+
+            const fov = camera.fov * (Math.PI / 180);
+            const dist = Math.abs(maxDim / (2 * Math.tan(fov / 2))) * 1.8;
+            camera.position.set(0, 0, dist);
+            camera.near = dist / 100;
+            camera.far = dist * 100;
+            camera.updateProjectionMatrix();
+
             const meshes: THREE.Mesh[] = [];
             gltf.scene.traverse((child) => {
               if ((child as THREE.Mesh).isMesh) {
@@ -415,13 +452,11 @@ function GltfViewer({ src, highlightLabel }: { src: string; highlightLabel: stri
                 if (Array.isArray(mesh.material)) {
                   mesh.material = mesh.material.map((material) => {
                     const cloned = material.clone();
-                    (cloned as THREE.MeshStandardMaterial).vertexColors = true;
                     rememberDefaults(cloned);
                     return cloned;
                   });
                 } else {
                   mesh.material = mesh.material.clone();
-                  (mesh.material as THREE.MeshStandardMaterial).vertexColors = true;
                   rememberDefaults(mesh.material);
                 }
                 meshes.push(mesh);
@@ -429,10 +464,6 @@ function GltfViewer({ src, highlightLabel }: { src: string; highlightLabel: stri
             });
             meshesRef.current = meshes;
             applyHighlight(highlightLabelRef.current);
-            // Center model
-            const box = new THREE.Box3().setFromObject(gltf.scene);
-            const center = box.getCenter(new THREE.Vector3());
-            gltf.scene.position.sub(center);
           },
           undefined,
           () => setStatus("Error loading model via Three.js")
@@ -446,9 +477,13 @@ function GltfViewer({ src, highlightLabel }: { src: string; highlightLabel: stri
     // Animation loop with post-processing
     const animate = () => {
       animId = requestAnimationFrame(animate);
-      scene.children.forEach((c) => {
-        if ((c as THREE.Group).isGroup) c.rotation.y += 0.003;
-      });
+      controls?.update();  // required for damping
+      // Only auto-rotate if user hasn't interacted
+      if (!controls || !controls.enabled) {
+        scene.children.forEach((c) => {
+          if ((c as THREE.Group).isGroup) c.rotation.y += 0.003;
+        });
+      }
       
       // Use post-processing composer if available, otherwise fallback to basic render
       if (effectComposer) {
@@ -476,6 +511,7 @@ function GltfViewer({ src, highlightLabel }: { src: string; highlightLabel: stri
     return () => {
       cancelAnimationFrame(animId);
       window.removeEventListener("resize", handleResize);
+      controls?.dispose();
       renderer.dispose();
       meshesRef.current = [];
       materialDefaultsRef.current.clear();
