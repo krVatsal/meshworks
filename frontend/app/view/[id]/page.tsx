@@ -23,6 +23,7 @@ import {
 
 const API = `${process.env.NEXT_PUBLIC_BACKEND_URL}/api`;
 
+
 interface ModelData {
   type: string;
   title: string;
@@ -60,6 +61,8 @@ export default function ViewerPage() {
   const [copied, setCopied] = useState(false);
   const [showChat, setShowChat] = useState(false);
   const [highlightedLabel, setHighlightedLabel] = useState<string | null>(null);
+  const [animating, setAnimating] = useState<{segments: {name: string; description: string}[]} | null>(null);
+  const [loadingStory, setLoadingStory] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -87,6 +90,19 @@ export default function ViewerPage() {
       navigator.clipboard.writeText(data.original_prompt);
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
+    }
+  };
+
+  const startStoryMode = async () => {
+    if (!data?.id) return;
+    setLoadingStory(true);
+    try {
+      const res = await axios.get(`${API}/narration/${data.id}`);
+      setAnimating({ segments: res.data.segments });
+    } catch {
+      console.error("Failed to load narration");
+    } finally {
+      setLoadingStory(false);
     }
   };
 
@@ -123,7 +139,12 @@ export default function ViewerPage() {
     >
       {/* 3D Viewer */}
       <div className="flex-1 relative bg-obsidian border-r border-white/5 min-h-[50vh] lg:min-h-0">
-        <ModelViewer model={activeModel} highlightLabel={highlightedLabel} />
+        <ModelViewer 
+          model={activeModel} 
+          highlightLabel={highlightedLabel}
+          animating={animating}
+          onAnimationEnd={() => setAnimating(null)}
+        />
 
         {/* Back button overlay */}
         <button
@@ -166,6 +187,28 @@ export default function ViewerPage() {
             <MessageSquare size={11} />
             {showChat ? "CLOSE CHAT" : "CHAT ABOUT MODEL"}
           </button>
+
+          <button
+            onClick={animating 
+            ? () => { setAnimating(null); window.speechSynthesis?.cancel(); setHighlightedLabel(null); } 
+            : startStoryMode
+            }
+            disabled={loadingStory}
+            className={`mt-2 w-full flex items-center justify-center gap-2 py-2 border font-mono text-[10px] tracking-widest transition-colors duration-200 disabled:opacity-40 disabled:cursor-not-allowed ${
+              animating
+                ? "border-neon-red/60 bg-neon-red/10 text-neon-red"
+                : "border-white/10 text-slate-500 hover:border-cyber/30 hover:text-cyber/70"
+            }`}
+          >
+            {loadingStory ? (
+              <span className="animate-pulse">GENERATING STORY...</span>
+            ) : animating ? (
+              "⏹ STOP STORY"
+            ) : (
+              "▶ STORY MODE"
+            )}
+          </button>
+
         </div>
 
         {/* Prompt */}

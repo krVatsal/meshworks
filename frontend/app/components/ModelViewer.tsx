@@ -13,9 +13,13 @@ interface ModelData {
 export default function ModelViewer({
   model,
   highlightLabel,
+  animating,
+  onAnimationEnd,
 }: {
   model: ModelData | null;
   highlightLabel?: string | null;
+  animating?: { segments: {name: string; description: string}[] } | null;
+  onAnimationEnd?: () => void;
 }) {
   if (!model || model.type === "none") {
     return <NoModelState />;
@@ -23,7 +27,12 @@ export default function ModelViewer({
 
   // All approved models are now served as GLB from /api/output/ — use Three.js
   if (model.url) {
-    return <GltfViewer src={model.url} highlightLabel={highlightLabel ?? null} />;
+    return <GltfViewer 
+      src={model.url} 
+      highlightLabel={highlightLabel ?? null}
+      animating={animating}
+      onAnimationEnd={onAnimationEnd}
+    />;
   }
 
   // Fallback only: embed-only Sketchfab models that couldn't be downloaded
@@ -195,7 +204,12 @@ function bestMeshMatch(meshes: THREE.Mesh[], label: string): THREE.Mesh | null {
   return bestScore >= 30 ? best : null;
 }
 
-function GltfViewer({ src, highlightLabel }: { src: string; highlightLabel: string | null }) {
+function GltfViewer({ src, highlightLabel, animating, onAnimationEnd }: { 
+  src: string; 
+  highlightLabel: string | null;
+  animating?: { segments: {name: string; description: string}[] } | null;
+  onAnimationEnd?: () => void;
+}) {
   const mountRef = useRef<HTMLDivElement>(null);
   const [status, setStatus] = useState<string | null>(
     "Loading Three.js renderer..."
@@ -205,6 +219,8 @@ function GltfViewer({ src, highlightLabel }: { src: string; highlightLabel: stri
   const materialDefaultsRef = useRef<Map<string, any>>(new Map());
   const meshesRef = useRef<THREE.Mesh[]>([]);
   const highlightLabelRef = useRef<string | null>(highlightLabel);
+  const animatingRef = useRef(animating);
+  useEffect(() => { animatingRef.current = animating; }, [animating]);
 
   const getMeshMaterials = (mesh: THREE.Mesh): THREE.Material[] => {
     const material = mesh.material;
@@ -452,11 +468,13 @@ function GltfViewer({ src, highlightLabel }: { src: string; highlightLabel: stri
                 if (Array.isArray(mesh.material)) {
                   mesh.material = mesh.material.map((material) => {
                     const cloned = material.clone();
+                    cloned.side = THREE.DoubleSide;
                     rememberDefaults(cloned);
                     return cloned;
                   });
                 } else {
                   mesh.material = mesh.material.clone();
+                  mesh.material.side = THREE.DoubleSide;
                   rememberDefaults(mesh.material);
                 }
                 meshes.push(mesh);
@@ -530,6 +548,50 @@ function GltfViewer({ src, highlightLabel }: { src: string; highlightLabel: stri
       applyHighlight(highlightLabel);
     }
   }, [highlightLabel]);
+
+  useEffect(() => {
+    if (!animating || !meshesRef.current.length) return;
+
+    let cancelled = false;
+    
+
+    const runSequence = async () => {
+      for (const seg of animating.segments) {
+        if (cancelled) break;
+
+        const mesh = bestMeshMatch(meshesRef.current, seg.name);
+        if (!mesh) continue;
+
+        // Just highlight — no movement
+        applyHighlight(seg.name);
+
+        // Narrate
+        await new Promise<void>(resolve => {
+          if (!window.speechSynthesis) { resolve(); return; }
+          window.speechSynthesis.cancel();
+          const u = new SpeechSynthesisUtterance(seg.description);
+          u.rate = 0.9;
+          u.onend = () => resolve();
+          u.onerror = () => resolve();
+          window.speechSynthesis.speak(u);
+        });
+
+        if (cancelled) break;
+        await new Promise(r => setTimeout(r, 200));
+      }
+
+      if (!cancelled) {
+        applyHighlight(null);
+        onAnimationEnd?.();
+      }
+    };
+
+    runSequence();
+    return () => {
+      cancelled = true;
+      window.speechSynthesis?.cancel();
+    };
+  }, [animating]);
 
   return (
     <div

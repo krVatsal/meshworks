@@ -69,6 +69,80 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# per segment narration helper
+
+class SegmentNarrationResponse(BaseModel):
+    segments: List[Dict[str, str]]  # [{"name": "...", "description": "..."}]
+
+@api_router.get("/narration/{search_id}", response_model=SegmentNarrationResponse)
+async def get_segment_narration(search_id: str):
+    record = await db.searches.find_one({"id": search_id}, {"_id": 0})
+    if not record:
+        raise HTTPException(status_code=404, detail="Search not found")
+
+    # Match scored_result to primary model by URL
+    primary = record.get("primary_model") or {}
+    primary_url = primary.get("url") or primary.get("embed_url")
+
+    scored = record.get("scored_results", [])
+    primary_result = next(
+        (r for r in scored
+         if (r.get("model", {}).get("url") or r.get("model", {}).get("embed_url")) == primary_url),
+        scored[0] if scored else None,
+    )
+    node_names = primary_result.get("node_names", []) if primary_result else []
+
+    if not node_names:
+        raise HTTPException(status_code=404, detail="No segments found")
+
+    prompt_context = record.get("original_prompt", "3D model")
+    attributes = record.get("attributes") or {}
+    object_type = attributes.get("object_type", "object")
+
+    # Ask LLM for one description per segment
+    def _call():
+        return groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"You are an educational narrator for a 3D model viewer.\n"
+                    f"The model is: {prompt_context} (type: {object_type})\n"
+                    f"For each segment name below, write a SHORT educational description "
+                    f"(1-2 sentences max, suitable for text-to-speech narration).\n"
+                    f"Rules:\n"
+                    f"- Describe only the ANATOMY or FUNCTION of that body part\n"
+                    f"- Do NOT mention 3D models, nodes, meshes, animations, subnodes, or technical terms\n"
+                    f"- Do NOT say things like 'this segment', 'this part of the model', 'subnodes'\n"
+                    f"- Write as if you are a biology teacher explaining to a student\n"
+                    f"- Keep it under 2 sentences\n"
+                    f"Return ONLY valid JSON: {{\"segments\": ["
+                    f"{{\"name\": \"segment_name\", \"description\": \"...\"}}]}}\n\n"
+                    f"Segments: {json.dumps(node_names)}"
+                )
+            }],
+            response_format={"type": "json_object"},
+            max_tokens=2000,
+            temperature=0.4,
+        )
+
+    loop = asyncio.get_event_loop()
+    try:
+        completion = await loop.run_in_executor(None, _call)
+        data = json.loads(completion.choices[0].message.content)
+        segments = data.get("segments", [])
+        # Fallback if LLM returns wrong shape
+        if not segments:
+            segments = [{"name": n, "description": f"This is the {n.replace('_', ' ')}."} 
+                       for n in node_names]
+    except Exception as e:
+        logger.error(f"Narration generation failed: {e}")
+        segments = [{"name": n, "description": f"This is the {n.replace('_', ' ')}."} 
+                   for n in node_names]
+
+    return SegmentNarrationResponse(segments=segments)
+
+
 # ─── Segmentation helper ──────────────────────────────────────────────────────
 
 APP_DIR    = Path(__file__).parent          # …/app/
@@ -740,9 +814,19 @@ async def search_models(request: SearchRequest, http_request: Request):
         
         scored_models = []
         all_scoring_results = []  # Track all models for summary
-        
-        # Download and score each model
-        for i, model in enumerate(models[:5], 1):  # Limit to top 5 to avoid long delays
+
+        # Keep fetching until 5 scorable models found or 15 attempts made
+        MAX_ATTEMPTS  = 15
+        TARGET_SCORED = 5
+        attempts      = 0
+        scored_count  = 0
+
+        for model in models[:MAX_ATTEMPTS]:
+            if scored_count >= TARGET_SCORED:
+                break
+            attempts += 1
+            i = attempts
+
             model_url = model.url
             if not model_url:
                 continue
@@ -842,7 +926,8 @@ async def search_models(request: SearchRequest, http_request: Request):
                                 "semantic_score": score_result.semantic.combined,
                                 "geometric_score": score_result.geometric.combined,
                             })
-                            logger.info(f"  📦 Node names ({len(score_result.node_names)}): {score_result.node_names}")
+                            scored_count += 1
+                            logger.info(f"  📦 Node names ({len(semantic_names)}): {semantic_names}")
                         else:
                             logger.warning("     [segment] ⚠️  Failed — skipping this model")
                     
@@ -868,6 +953,7 @@ async def search_models(request: SearchRequest, http_request: Request):
                             "semantic_score": score_result.semantic.combined,
                             "geometric_score": score_result.geometric.combined,
                         })
+                        scored_count += 1
                         logger.info(f"  📦 Node names ({len(node_names)}): {node_names}")
                     
                     elif score_result.decision == "RENAME":
@@ -902,10 +988,11 @@ async def search_models(request: SearchRequest, http_request: Request):
                             "score": score_result.final_score,
                             "decision": score_result.decision,
                             "is_labelled": True,  # Now has refined labels
-                            "node_names": score_result.node_names,
+                            "node_names": semantic_names,
                             "semantic_score": score_result.semantic.combined,
                             "geometric_score": score_result.geometric.combined,
                         })
+                        scored_count += 1
                         logger.info(f"  📦 Node names ({len(semantic_names)}): {semantic_names}")
                     
                     elif score_result.decision == "PENDING":
@@ -954,7 +1041,7 @@ async def search_models(request: SearchRequest, http_request: Request):
         
         logger.info(f"{'='*90}")
         logger.info(f"  THRESHOLDS: Labelled models need >{THRESHOLD_LABELLED:.2f} | Unlabelled models need >{THRESHOLD_UNLABELLED:.2f}")
-        logger.info(f"  RESULT: {len(scored_models)} APPROVED / {len(all_scoring_results)} EVALUATED")
+        logger.info(f"  RESULT: {len(scored_models)} APPROVED / {len(all_scoring_results)} EVALUATED / {attempts} ATTEMPTED")
         logger.info(f"{'='*90}\n")
         
         # ─── FALLBACK STRATEGY: Generate model if none approved (includes score < 0.5) ───

@@ -521,7 +521,7 @@ And the user intent: \"{prompt}\"
 
 Are these labels semantically meaningful, anatomically correct, and well-defined for this model type? Answer with only 'yes' or 'no'."""
         
-        response = client.messages.create(
+        response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": check_prompt}],
             max_tokens=10

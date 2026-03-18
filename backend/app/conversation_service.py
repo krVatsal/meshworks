@@ -89,10 +89,13 @@ async def handle_model_chat(request: ChatRequest, db, groq_client, logger) -> Ch
          if (r.get("model", {}).get("url") or r.get("model", {}).get("embed_url")) == primary_url),
         None,
     )
-    # Fallback: if URL match fails (e.g. single result), use first scored entry
     if primary_result is None and record.get("scored_results"):
         primary_result = record["scored_results"][0]
+
     node_names = primary_result.get("node_names", []) if primary_result else []
+
+    # Debug log so you can verify correct names are being used
+    logger.info(f"[Chat] Using node_names for {primary_url}: {node_names}")
 
     original_prompt = record.get("original_prompt", "")
     attributes = record.get("attributes") or {}
