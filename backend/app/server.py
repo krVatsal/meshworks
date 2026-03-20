@@ -95,6 +95,29 @@ async def get_segment_narration(search_id: str):
     if not node_names:
         raise HTTPException(status_code=404, detail="No segments found")
 
+    # Filter out rig bones, numbered variants, and technical nodes
+    def is_meaningful(name: str) -> bool:
+        n = name.lower()
+        # Skip Sketchfab boilerplate
+        if any(skip in n for skip in ["sketchfab", "gltf", "rootnode", "root", "object_", "gltf_created"]):
+            return False
+        # Skip numbered bone variants like f_pinky.02.L, brow.T.R.001
+        if re.search(r'\.\d+', name):
+            return False
+        # Skip pure index suffixes like spine_131, jaw_11
+        if re.search(r'_\d+$', name):
+            return False
+        return True
+
+    meaningful = [n for n in node_names if is_meaningful(n)]
+
+    # If filtering too aggressive, fall back to first 30 original names
+    if len(meaningful) < 3:
+        meaningful = node_names[:30]
+
+    # Cap at 30 to stay within token budget
+    node_names = meaningful[:30]
+
     prompt_context = record.get("original_prompt", "3D model")
     attributes = record.get("attributes") or {}
     object_type = attributes.get("object_type", "object")
@@ -122,7 +145,7 @@ async def get_segment_narration(search_id: str):
                 )
             }],
             response_format={"type": "json_object"},
-            max_tokens=2000,
+            max_tokens=3000,
             temperature=0.4,
         )
 
@@ -935,15 +958,15 @@ async def search_models(request: SearchRequest, http_request: Request):
                         logger.info(f"  ✅ USE: Score {score_result.final_score:.4f} ≥ 0.5, well-defined labels")
                         logger.info(f"     → Copying to output for Three.js rendering ...")
 
-                        out_path = _copy_to_output(str(fetch_result.local_path))
+                        final_path = _copy_to_output(str(fetch_result.local_path))
                         node_names = getattr(score_result, "node_names", []) or []
 
                         model = ModelInfo(
-                                **{**model.model_dump(),
-                                   "type": "glb",
-                                   "url": f"/api/output/{Path(final_path).name}",
-                                   "description": (model.description or "") + " [segmented + renamed]"}
-                            )
+                            **{**model.model_dump(),
+                               "type": "glb",
+                               "url": f"/api/output/{Path(final_path).name}",
+                               "description": (model.description or "") + " [used directly]"}
+                        )
                         scored_models.append({
                             "model": model,
                             "score": score_result.final_score,
