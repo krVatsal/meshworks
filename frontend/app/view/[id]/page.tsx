@@ -401,6 +401,7 @@ export default function ViewerPage() {
           <ChatPanel
             searchId={id}
             modelTitle={activeModel?.title ?? data?.original_prompt ?? "3D Model"}
+            modelUrl={activeModel?.url ?? activeModel?.embed_url}
             onLabelSelect={setHighlightedLabel}
           />
         </div>
