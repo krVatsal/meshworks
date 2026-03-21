@@ -13,16 +13,16 @@ class ChatRequest(BaseModel):
     search_id: str
     message: str
     conversation_id: Optional[str] = None
+    model_url: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
     response: str
-    explanation: str  # Detailed explanation for TTS narration
+    explanation: str
     conversation_id: str
     matched_label: Optional[str] = None
 
 
-# Store (timestamp, messages) to enable TTL-based pruning
 _chat_histories: Dict[str, Tuple[float, List[Dict[str, str]]]] = {}
 
 
@@ -64,9 +64,43 @@ def _pick_closest_label(candidate: Optional[str], labels: List[str]) -> Optional
     return None
 
 
+def _select_model_result(record: dict, requested_model_url: str) -> Tuple[dict, dict]:
+    primary = record.get("primary_model") or {}
+    scored_results = record.get("scored_results", [])
+
+    selected_result = None
+    if requested_model_url:
+        selected_result = next(
+            (
+                result for result in scored_results
+                if requested_model_url in {
+                    str(result.get("model", {}).get("url") or ""),
+                    str(result.get("model", {}).get("embed_url") or ""),
+                }
+            ),
+            None,
+        )
+
+    if selected_result is None:
+        primary_url = primary.get("url") or primary.get("embed_url")
+        selected_result = next(
+            (
+                result for result in scored_results
+                if (result.get("model", {}).get("url") or result.get("model", {}).get("embed_url")) == primary_url
+            ),
+            None,
+        )
+
+    if selected_result is None and scored_results:
+        selected_result = scored_results[0]
+
+    selected_model = (selected_result or {}).get("model") or primary
+    return selected_model, selected_result or {}
+
+
 async def handle_model_chat(request: ChatRequest, db, groq_client, logger) -> ChatResponse:
     global _chat_histories
-    
+
     message = request.message.strip()
     if not message:
         raise HTTPException(status_code=400, detail="Message cannot be empty.")
@@ -75,27 +109,18 @@ async def handle_model_chat(request: ChatRequest, db, groq_client, logger) -> Ch
     if not record:
         raise HTTPException(status_code=404, detail="Search not found")
 
-    primary = record.get("primary_model") or {}
-    title = primary.get("title") or "Unknown model"
-    description = primary.get("description") or ""
-    tags = primary.get("tags") or []
+    requested_model_url = (request.model_url or "").strip()
+    selected_model, selected_result = _select_model_result(record, requested_model_url)
+
+    title = selected_model.get("title") or "Unknown model"
+    description = selected_model.get("description") or ""
+    tags = selected_model.get("tags") or []
     if not isinstance(tags, list):
         tags = [str(tags)]
 
-    # Extract node names from primary model — match by URL since ModelInfo has no id field
-    primary_url = primary.get("url") or primary.get("embed_url")
-    primary_result = next(
-        (r for r in record.get("scored_results", [])
-         if (r.get("model", {}).get("url") or r.get("model", {}).get("embed_url")) == primary_url),
-        None,
-    )
-    if primary_result is None and record.get("scored_results"):
-        primary_result = record["scored_results"][0]
-
-    node_names = primary_result.get("node_names", []) if primary_result else []
-
-    # Debug log so you can verify correct names are being used
-    logger.info(f"[Chat] Using node_names for {primary_url}: {node_names}")
+    node_names = selected_result.get("node_names", []) if selected_result else []
+    selected_url = selected_model.get("url") or selected_model.get("embed_url") or requested_model_url
+    logger.info(f"[Chat] Using node_names for {selected_url}: {node_names}")
 
     original_prompt = record.get("original_prompt", "")
     attributes = record.get("attributes") or {}
@@ -104,13 +129,9 @@ async def handle_model_chat(request: ChatRequest, db, groq_client, logger) -> Ch
     label_text = ", ".join(node_names) if node_names else "none"
     conversation_id = request.conversation_id or str(uuid.uuid4())
 
-    # Prune expired conversations (TTL: 1 hour) to prevent unbounded memory growth
     cutoff = time.time() - 3600
-    _chat_histories = {
-        k: v for k, v in _chat_histories.items() if v[0] > cutoff
-    }
+    _chat_histories = {k: v for k, v in _chat_histories.items() if v[0] > cutoff}
 
-    # Initialize conversation history if not present
     if conversation_id not in _chat_histories:
         _chat_histories[conversation_id] = (time.time(), [])
 
@@ -120,18 +141,18 @@ async def handle_model_chat(request: ChatRequest, db, groq_client, logger) -> Ch
         "You are an intelligent assistant for a 3D model viewer. "
         "For each user question, you MUST provide: "
         "1) A brief answer, "
-        "2) The exact name of the relevant anatomical structure/segment, "
+        "2) The exact name of the relevant structure/segment or component, "
         "3) A detailed, educational explanation suitable for text-to-speech narration.\n"
         f"Model title: {title}\n"
         f"Model description: {description}\n"
         f"Model tags: {', '.join(tags) if tags else 'none'}\n"
         f"Original search prompt: {original_prompt}\n"
         f"Extracted attributes: {attributes_str}\n"
-        f"Available anatomical structures/segments: {label_text}\n\n"
+        f"Available structures/segments: {label_text}\n\n"
         "Return ONLY valid JSON with this exact structure: "
         '{"answer":"<concise answer in 1-2 sentences>",'
         '"best_label":"<exact segment name from available segments or null>",'
-        '"explanation":"<detailed 2-3 paragraph explanation suitable for text-to-speech narration. Explain the anatomical function, location, and relevance to the user question. Use clear, educational language.>"}. '
+        '"explanation":"<detailed 2-3 paragraph explanation suitable for text-to-speech narration. Explain the function, location, and relevance to the user question using clear educational language.>"}. '
         "If no suitable segment exists, set best_label to null. "
         "The explanation should be thorough, educational, and engaging for audio narration."
     )
@@ -141,31 +162,28 @@ async def handle_model_chat(request: ChatRequest, db, groq_client, logger) -> Ch
     ]
 
     def _call_chat():
-        print(messages)
         return groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=messages,
             response_format={"type": "json_object"},
             temperature=0.2,
-            max_tokens=1000,  # Increased for detailed explanations
+            max_tokens=1000,
         )
 
     try:
         loop = asyncio.get_event_loop()
         completion = await loop.run_in_executor(None, _call_chat)
         content = completion.choices[0].message.content or "{}"
-        print(completion.choices[0])
         payload = json.loads(content)
     except Exception as exc:
         logger.error("Model chat error: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail="Chat failed")
 
     answer = str(payload.get("answer") or "I could not answer that.")
-    explanation = str(payload.get("explanation") or answer)  # Fallback to answer if no explanation
+    explanation = str(payload.get("explanation") or answer)
     label_from_llm = payload.get("best_label")
     matched_label = _pick_closest_label(str(label_from_llm) if label_from_llm else None, node_names)
 
-    # Append to stored history dict, not local reference
     _, history_list = _chat_histories[conversation_id]
     history_list.append({"role": "user", "content": message})
     history_list.append({"role": "assistant", "content": answer})

@@ -28,6 +28,7 @@ interface Message {
 interface ChatPanelProps {
   searchId: string;
   modelTitle: string;
+  modelUrl?: string;
   onLabelSelect?: (label: string | null) => void;
 }
 
@@ -321,7 +322,7 @@ function MessageBubble({
 /* ─────────────────────────────────────────────────────────────────────
    MAIN EXPORT
 ───────────────────────────────────────────────────────────────────── */
-export default function ChatPanel({ searchId, modelTitle, onLabelSelect }: ChatPanelProps) {
+export default function ChatPanel({ searchId, modelTitle, modelUrl, onLabelSelect }: ChatPanelProps) {
   const [messages, setMessages] = useState<Message[]>([
     {
       role: "assistant",
@@ -339,6 +340,19 @@ export default function ChatPanel({ searchId, modelTitle, onLabelSelect }: ChatP
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, loading]);
+
+  useEffect(() => {
+    window.speechSynthesis?.cancel();
+    setNarration(null);
+    setConversationId(null);
+    setMessages([
+      {
+        role: "assistant",
+        content: `Hi! I can answer questions about **${modelTitle}** and its parts, structure, function, or features.`,
+      },
+    ]);
+    onLabelSelect?.(null);
+  }, [modelTitle, modelUrl, onLabelSelect]);
 
   /* ── textarea auto-height ── */
   const handleInput = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
@@ -361,6 +375,7 @@ export default function ChatPanel({ searchId, modelTitle, onLabelSelect }: ChatP
         search_id: searchId,
         message: text,
         conversation_id: conversationId,
+        model_url: modelUrl ?? null,
       });
       const matchedLabel: string | null = res.data.matched_label ?? null;
       const explanation: string = res.data.explanation ?? res.data.response;
