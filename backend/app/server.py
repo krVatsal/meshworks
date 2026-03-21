@@ -130,15 +130,20 @@ async def get_segment_narration(search_id: str):
                 "role": "user",
                 "content": (
                     f"You are an educational narrator for a 3D model viewer.\n"
-                    f"The model is: {prompt_context} (type: {object_type})\n"
-                    f"For each segment name below, write a SHORT educational description "
-                    f"(1-2 sentences max, suitable for text-to-speech narration).\n"
+                    f"The full model is: {prompt_context} (type: {object_type})\n"
+                    f"For each segment name below, write a short spoken explanation suitable for narration.\n"
+                    f"Adapt the explanation to the kind of model:\n"
+                    f"- For living things, explain the part's role, structure, or biological function.\n"
+                    f"- For machines, vehicles, tools, or devices, explain the component's purpose, placement, or how it contributes to operation.\n"
+                    f"- For buildings, furniture, or crafted objects, explain the structural, functional, or decorative role of the part.\n"
+                    f"- If the name is ambiguous, give the most likely plain-English explanation based on the full model context.\n"
                     f"Rules:\n"
-                    f"- Describe only the ANATOMY or FUNCTION of that body part\n"
-                    f"- Do NOT mention 3D models, nodes, meshes, animations, subnodes, or technical terms\n"
-                    f"- Do NOT say things like 'this segment', 'this part of the model', 'subnodes'\n"
-                    f"- Write as if you are a biology teacher explaining to a student\n"
-                    f"- Keep it under 2 sentences\n"
+                    f"- Focus on what the part is, what it does, where it is, or why it matters.\n"
+                    f"- Use natural, listener-friendly language for a general audience.\n"
+                    f"- Keep each description to 1-2 sentences.\n"
+                    f"- Do NOT mention 3D models, segments, nodes, meshes, animations, rendering, geometry, or technical pipeline terms.\n"
+                    f"- Do NOT say phrases like 'this segment', 'this part of the model', or 'in the 3D view'.\n"
+                    f"- If a segment name is unclear, avoid inventing very specific facts; stay broadly accurate and modest.\n"
                     f"Return ONLY valid JSON: {{\"segments\": ["
                     f"{{\"name\": \"segment_name\", \"description\": \"...\"}}]}}\n\n"
                     f"Segments: {json.dumps(node_names)}"
@@ -232,7 +237,26 @@ def _rewrite_glb_with_names(data: bytes, names_dict: dict) -> bytes:
     return header + new_chunk + rest
 
 
-async def rename_segmented_model(segmented_path: str, hint: str = "") -> tuple[Optional[str], list[str]]:
+def _build_rename_context(
+    prompt: str = "",
+    attributes: Optional["SearchAttributes"] = None,
+    model: Optional["ModelInfo"] = None,
+) -> Dict[str, Any]:
+    return {
+        "prompt": prompt or "",
+        "object_type": attributes.object_type if attributes else "",
+        "keywords": list(attributes.keywords) if attributes and attributes.keywords else [],
+        "title": model.title if model else "",
+        "description": model.description if model else "",
+        "tags": list(model.tags) if model and model.tags else [],
+    }
+
+
+async def rename_segmented_model(
+    segmented_path: str,
+    hint: str = "",
+    context: Optional[Dict[str, Any]] = None,
+) -> tuple[Optional[str], list[str]]:
     """
     Rename segments in a segmented GLB to semantic names using LLM.
     
@@ -260,7 +284,8 @@ async def rename_segmented_model(segmented_path: str, hint: str = "") -> tuple[O
         rename_result = await rename_meshes_from_file(
             filename=segmented_file.name,
             data=glb_data,
-            hint=hint or "anatomical structure"
+            hint=hint or "object",
+            context=context,
         )
         
         if not rename_result.get("names"):
@@ -654,73 +679,8 @@ def _extract_image_urls(search_result: Dict[str, Any]) -> List[str]:
     return deduped
 
 
-async def _search_wikimedia_image_urls(prompt: str, max_results: int = 12) -> List[str]:
-    """Fetch candidate image URLs from Wikimedia Commons without API keys."""
-    api_url = "https://commons.wikimedia.org/w/api.php"
-    params = {
-        "action": "query",
-        "format": "json",
-        "generator": "search",
-        "gsrsearch": prompt,
-        "gsrnamespace": 6,  # File namespace
-        "gsrlimit": max_results,
-        "prop": "imageinfo",
-        "iiprop": "url|mime",
-        "origin": "*",
-    }
-
-    headers = {
-        "User-Agent": "Prompt2Mesh/1.0 (+https://github.com)",
-        "Accept": "application/json",
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True, headers=headers) as client:
-            resp = await client.get(api_url, params=params)
-            if resp.status_code != 200:
-                return []
-            payload = resp.json()
-    except Exception as exc:
-        logger.warning("Wikimedia image search failed: %s", exc)
-        return []
-
-    pages = (payload.get("query") or {}).get("pages") or {}
-    urls: List[str] = []
-    for page in pages.values():
-        infos = page.get("imageinfo") or []
-        if not infos:
-            continue
-        info = infos[0]
-        mime = (info.get("mime") or "").lower()
-        if not mime.startswith("image/"):
-            continue
-        url = info.get("url")
-        if isinstance(url, str) and url.startswith("http"):
-            urls.append(url)
-
-    # De-duplicate while preserving order
-    deduped: List[str] = []
-    seen = set()
-    for url in urls:
-        if url not in seen:
-            seen.add(url)
-            deduped.append(url)
-    return deduped
-
-
-def _public_image_seed_urls(prompt: str) -> List[str]:
-    """Provide no-key image URLs as the last-resort fallback."""
-    q = re.sub(r"\s+", ",", prompt.strip())
-    seed = re.sub(r"[^a-zA-Z0-9_-]", "", prompt.lower().replace(" ", "-"))[:40] or "prompt2mesh"
-    return [
-        f"https://loremflickr.com/1600/900/{q}",
-        f"https://picsum.photos/seed/{seed}/1600/900",
-    ]
-
-
 async def _download_high_quality_image_for_prompt(prompt: str) -> tuple[bytes, str, str]:
     loop = asyncio.get_event_loop()
-    allowed_mimes = {"image/jpeg", "image/png", "image/webp"}
 
     search_queries = [
         f"{prompt} high quality 3d render 8k",
@@ -750,31 +710,13 @@ async def _download_high_quality_image_for_prompt(prompt: str) -> tuple[bytes, s
             logger.warning("Tavily image search failed for query '%s': %s", query, exc)
 
     if not candidate_urls:
-        logger.warning("No Tavily image candidates. Falling back to Wikimedia Commons image search.")
-        candidate_urls = await _search_wikimedia_image_urls(f"{prompt} 3d render")
-        if not candidate_urls:
-            candidate_urls = await _search_wikimedia_image_urls(prompt)
-
-    if not candidate_urls:
-        logger.warning("No Wikimedia candidates. Falling back to public seeded image providers.")
-        candidate_urls = _public_image_seed_urls(prompt)
-
-    if not candidate_urls:
-        raise HTTPException(
-            status_code=502,
-            detail="No candidate images found via Tavily or Wikimedia",
-        )
+        raise HTTPException(status_code=502, detail="No candidate images found via Tavily")
 
     best_bytes: Optional[bytes] = None
     best_url: Optional[str] = None
     best_mime: str = "application/octet-stream"
 
-    download_headers = {
-        "User-Agent": "Prompt2Mesh/1.0 (+https://github.com)",
-        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-    }
-
-    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, headers=download_headers) as client:
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
         for image_url in candidate_urls[:12]:
             try:
                 resp = await client.get(image_url)
@@ -783,8 +725,6 @@ async def _download_high_quality_image_for_prompt(prompt: str) -> tuple[bytes, s
 
                 content_type = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
                 if not content_type.startswith("image/"):
-                    continue
-                if content_type not in allowed_mimes:
                     continue
 
                 payload = resp.content
@@ -797,29 +737,6 @@ async def _download_high_quality_image_for_prompt(prompt: str) -> tuple[bytes, s
                     best_mime = content_type
             except Exception:
                 continue
-
-        # Last resort: if all fetched candidates were invalid MIME/size, try seeded public providers.
-        if not best_bytes or not best_url:
-            for image_url in _public_image_seed_urls(prompt):
-                try:
-                    resp = await client.get(image_url)
-                    if resp.status_code != 200:
-                        continue
-
-                    content_type = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
-                    if content_type not in allowed_mimes:
-                        continue
-
-                    payload = resp.content
-                    if len(payload) < 100_000:
-                        continue
-
-                    best_bytes = payload
-                    best_url = image_url
-                    best_mime = content_type
-                    break
-                except Exception:
-                    continue
 
     if not best_bytes or not best_url:
         raise HTTPException(status_code=502, detail="Could not download a suitable high-quality image")
@@ -867,14 +784,18 @@ async def _generate_mesh_file_from_prompt(prompt: str) -> tuple[Path, str, int, 
     return output_path, image_url, len(image_bytes), mesh_api_url
 
 
-async def _segment_and_rename_generated_model(glb_path: Path, hint: str) -> tuple[Path, list[str]]:
+async def _segment_and_rename_generated_model(
+    glb_path: Path,
+    hint: str,
+    context: Optional[Dict[str, Any]] = None,
+) -> tuple[Path, list[str]]:
     """Apply the same segment -> rename flow used for approved unlabelled models."""
     segmented_path = await segment_model(str(glb_path))
     if not segmented_path:
         logger.warning("[fallback] Segmentation failed for generated mesh; using raw generated model")
         return glb_path, []
 
-    renamed_path, semantic_names = await rename_segmented_model(segmented_path, hint=hint)
+    renamed_path, semantic_names = await rename_segmented_model(segmented_path, hint=hint, context=context)
     if renamed_path:
         return Path(renamed_path), semantic_names
 
@@ -913,8 +834,24 @@ async def search_models(request: SearchRequest, http_request: Request):
         models = await search_models_with_tavily(attributes)
         
         if not models:
-            logger.warning(f"No existing models found for '{prompt}'. Will trigger mesh-generation fallback.")
-            
+            update = {
+                "attributes": attributes.model_dump(),
+                "primary_model": None,
+                "all_models": [],
+                "status": "no_model",
+            }
+            await db.searches.update_one({"id": record.id}, {"$set": update})
+            return SearchResponse(
+                id=record.id,
+                original_prompt=prompt,
+                attributes=attributes,
+                primary_model=None,
+                all_models=[],
+                status="no_model",
+                error_message=None,
+                created_at=record.created_at.isoformat(),
+            )
+
         # ─── SCORING & DECISION GATES ───────────────────────────────────────
         logger.info(f"\n{'='*80}")
         logger.info(f"Found {len(models)} models, starting scoring pipeline...")
@@ -1012,9 +949,11 @@ async def search_models(request: SearchRequest, http_request: Request):
                             
                             # Rename segments to semantic names using original prompt as hint
                             logger.info("     [rename] Applying semantic naming to segments ...")
+                            rename_context = _build_rename_context(prompt=prompt, attributes=attributes, model=model)
                             renamed_path, semantic_names = await rename_segmented_model(
                                 segmented_path, 
-                                hint=", ".join(attributes.keywords) if attributes.keywords else prompt
+                                hint=", ".join(attributes.keywords) if attributes.keywords else prompt,
+                                context=rename_context,
                             )
                             if renamed_path:
                                 logger.info(f"     [rename] ✅ Segments renamed: {semantic_names}")
@@ -1078,9 +1017,11 @@ async def search_models(request: SearchRequest, http_request: Request):
                         
                         # Call renamer to fix the labels
                         logger.info("     [rename] Refining node labels with semantic naming...")
+                        rename_context = _build_rename_context(prompt=prompt, attributes=attributes, model=model)
                         renamed_path, semantic_names = await rename_segmented_model(
                             str(fetch_result.local_path),
-                            hint=prompt or "anatomical structure"
+                            hint=", ".join(attributes.keywords) if attributes.keywords else prompt,
+                            context=rename_context,
                         )
                         
                         if renamed_path:
@@ -1168,7 +1109,23 @@ async def search_models(request: SearchRequest, http_request: Request):
                 logger.info(f"[fallback] Generated base mesh: {generated_path}")
 
                 rename_hint = ", ".join(attributes.keywords) if attributes.keywords else prompt
-                final_path, semantic_names = await _segment_and_rename_generated_model(generated_path, hint=rename_hint)
+                rename_context = _build_rename_context(
+                    prompt=prompt,
+                    attributes=attributes,
+                    model=ModelInfo(
+                        type="glb",
+                        title=f"Generated: {prompt}",
+                        source_url="",
+                        source_domain="mesh-generator",
+                        description=f"Generated from prompt: {prompt}",
+                        tags=attributes.keywords,
+                    ),
+                )
+                final_path, semantic_names = await _segment_and_rename_generated_model(
+                    generated_path,
+                    hint=rename_hint,
+                    context=rename_context,
+                )
 
                 output_url = str(http_request.url_for("serve_output_file", filename=final_path.name))
                 primary = ModelInfo(
@@ -1318,13 +1275,35 @@ async def serve_output_file(filename: str):
     )
 
 @api_router.post("/mesh/rename")
-async def mesh_rename(file: UploadFile = File(...), hint: str = Form(default="")):
+async def mesh_rename(
+    file: UploadFile = File(...),
+    hint: str = Form(default=""),
+    prompt: str = Form(default=""),
+    object_type: str = Form(default=""),
+    title: str = Form(default=""),
+    description: str = Form(default=""),
+    tags: str = Form(default=""),
+    keywords: str = Form(default=""),
+):
     if not file.filename:
         raise HTTPException(status_code=400, detail="Missing file name")
 
     try:
         data = await file.read()
-        result = await rename_meshes_from_file(file.filename, data, hint=hint or "")
+        rename_context = {
+            "prompt": prompt,
+            "object_type": object_type,
+            "title": title,
+            "description": description,
+            "tags": [part.strip() for part in tags.split(",") if part.strip()],
+            "keywords": [part.strip() for part in keywords.split(",") if part.strip()],
+        }
+        result = await rename_meshes_from_file(
+            file.filename,
+            data,
+            hint=hint or prompt or "",
+            context=rename_context,
+        )
         return result
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1340,7 +1319,19 @@ async def generate_mesh_from_prompt(request: MeshFromPromptRequest, http_request
         raise HTTPException(status_code=400, detail="Prompt cannot be empty")
 
     generated_path, image_url, image_bytes, mesh_api_url = await _generate_mesh_file_from_prompt(prompt)
-    final_path, _ = await _segment_and_rename_generated_model(generated_path, hint=prompt)
+    rename_context = {
+        "prompt": prompt,
+        "object_type": "",
+        "title": f"Generated: {prompt}",
+        "description": f"Generated from prompt: {prompt}",
+        "tags": [],
+        "keywords": [],
+    }
+    final_path, _ = await _segment_and_rename_generated_model(
+        generated_path,
+        hint=prompt,
+        context=rename_context,
+    )
 
     output_url = str(http_request.url_for("serve_output_file", filename=final_path.name))
 
