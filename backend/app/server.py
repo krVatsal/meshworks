@@ -1,0 +1,1685 @@
+from fastapi import FastAPI, APIRouter, HTTPException, Query, UploadFile, File, Form, BackgroundTasks, Request
+from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+from pydantic import BaseModel, Field
+from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone, timedelta
+from groq import Groq
+from tavily import TavilyClient
+import sys
+import os
+import logging
+import re
+import json
+import asyncio
+import shutil
+import uuid
+import mimetypes
+from pathlib import Path
+from dotenv import load_dotenv
+import httpx
+import tempfile
+import aiofiles
+
+from app.blender_mcp import blender_client, conversation_store
+from app.mesh_renamer import rename_meshes_from_file
+from app.model_scorer import (
+    score_model, 
+    score_candidates, 
+    THRESHOLD_LABELLED, 
+    THRESHOLD_UNLABELLED,
+    SEMANTIC_WEIGHT,
+    GEOMETRIC_WEIGHT
+)
+from app.sketchfab_fetcher import (
+    fetch_model,
+    classify_url,
+    ModelSource,
+    FetchResult,
+    SketchfabMetadata
+)
+from app.conversation_service import (
+    ChatRequest,
+    ChatResponse,
+    handle_model_chat,
+)
+
+ROOT_DIR = Path(__file__).parent.parent.parent.parent  # Sankalp/
+load_dotenv(ROOT_DIR / '.env')
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+mongo_url = os.environ['MONGO_URL']
+db_client = AsyncIOMotorClient(mongo_url)
+db = db_client[os.environ['DB_NAME']]
+
+groq_client = Groq(api_key=os.environ['GROQ_API_KEY'])
+tavily_client = TavilyClient(api_key=os.environ['TAVILY_API_KEY'])
+
+app = FastAPI(title="3D Model Discovery API")
+api_router = APIRouter(prefix="/api")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# per segment narration helper
+
+class SegmentNarrationResponse(BaseModel):
+    segments: List[Dict[str, str]]  # [{"name": "...", "description": "..."}]
+
+@api_router.get("/narration/{search_id}", response_model=SegmentNarrationResponse)
+async def get_segment_narration(search_id: str):
+    record = await db.searches.find_one({"id": search_id}, {"_id": 0})
+    if not record:
+        raise HTTPException(status_code=404, detail="Search not found")
+
+    # Match scored_result to primary model by URL
+    primary = record.get("primary_model") or {}
+    primary_url = primary.get("url") or primary.get("embed_url")
+
+    scored = record.get("scored_results", [])
+    primary_result = next(
+        (r for r in scored
+         if (r.get("model", {}).get("url") or r.get("model", {}).get("embed_url")) == primary_url),
+        scored[0] if scored else None,
+    )
+    node_names = primary_result.get("node_names", []) if primary_result else []
+
+    if not node_names:
+        raise HTTPException(status_code=404, detail="No segments found")
+
+    # Filter out rig bones, numbered variants, and technical nodes
+    def is_meaningful(name: str) -> bool:
+        n = name.lower()
+        # Skip Sketchfab boilerplate
+        if any(skip in n for skip in ["sketchfab", "gltf", "rootnode", "root", "object_", "gltf_created"]):
+            return False
+        # Skip numbered bone variants like f_pinky.02.L, brow.T.R.001
+        if re.search(r'\.\d+', name):
+            return False
+        # Skip pure index suffixes like spine_131, jaw_11
+        if re.search(r'_\d+$', name):
+            return False
+        return True
+
+    meaningful = [n for n in node_names if is_meaningful(n)]
+
+    # If filtering too aggressive, fall back to first 30 original names
+    if len(meaningful) < 3:
+        meaningful = node_names[:30]
+
+    # Cap at 30 to stay within token budget
+    node_names = meaningful[:30]
+
+    prompt_context = record.get("original_prompt", "3D model")
+    attributes = record.get("attributes") or {}
+    object_type = attributes.get("object_type", "object")
+
+    # Ask LLM for one description per segment
+    def _call():
+        return groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"You are an educational narrator for a 3D model viewer.\n"
+                    f"The model is: {prompt_context} (type: {object_type})\n"
+                    f"For each segment name below, write a SHORT educational description "
+                    f"(1-2 sentences max, suitable for text-to-speech narration).\n"
+                    f"Rules:\n"
+                    f"- Describe only the ANATOMY or FUNCTION of that body part\n"
+                    f"- Do NOT mention 3D models, nodes, meshes, animations, subnodes, or technical terms\n"
+                    f"- Do NOT say things like 'this segment', 'this part of the model', 'subnodes'\n"
+                    f"- Write as if you are a biology teacher explaining to a student\n"
+                    f"- Keep it under 2 sentences\n"
+                    f"Return ONLY valid JSON: {{\"segments\": ["
+                    f"{{\"name\": \"segment_name\", \"description\": \"...\"}}]}}\n\n"
+                    f"Segments: {json.dumps(node_names)}"
+                )
+            }],
+            response_format={"type": "json_object"},
+            max_tokens=3000,
+            temperature=0.4,
+        )
+
+    loop = asyncio.get_event_loop()
+    try:
+        completion = await loop.run_in_executor(None, _call)
+        data = json.loads(completion.choices[0].message.content)
+        segments = data.get("segments", [])
+        # Fallback if LLM returns wrong shape
+        if not segments:
+            segments = [{"name": n, "description": f"This is the {n.replace('_', ' ')}."} 
+                       for n in node_names]
+    except Exception as e:
+        logger.error(f"Narration generation failed: {e}")
+        segments = [{"name": n, "description": f"This is the {n.replace('_', ' ')}."} 
+                   for n in node_names]
+
+    return SegmentNarrationResponse(segments=segments)
+
+
+# ─── Segmentation helper ──────────────────────────────────────────────────────
+
+APP_DIR    = Path(__file__).parent          # …/app/
+INPUT_DIR  = APP_DIR / "input"
+OUTPUT_DIR = APP_DIR / "output"
+
+# copy to ouput helper
+def _copy_to_output(local_path: str) -> Optional[str]:
+    """Copy a downloaded model to app/output/ and return the output path."""
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    src = Path(local_path)
+    dst = OUTPUT_DIR / src.name
+    if src.resolve() != dst.resolve():
+        shutil.copy2(src, dst)
+    return str(dst)
+
+
+def _rewrite_glb_with_names(data: bytes, names_dict: dict) -> bytes:
+    """Rewrite GLB JSON chunk to rename mesh nodes and their referencing nodes."""
+    if len(data) < 20 or data[0:4] != b"glTF":
+        raise ValueError("Not a valid GLB")
+
+    offset = 12
+    json_start = json_end = json_chunk_start = None
+    while offset + 8 <= len(data):
+        chunk_length = int.from_bytes(data[offset:offset+4], "little")
+        chunk_type   = int.from_bytes(data[offset+4:offset+8], "little")
+        data_start   = offset + 8
+        data_end     = data_start + chunk_length
+        if chunk_type == 0x4E4F534A:  # JSON chunk
+            json_chunk_start = offset
+            json_start = data_start
+            json_end   = data_end
+            break
+        offset = data_end
+
+    if json_start is None:
+        raise ValueError("No JSON chunk found")
+
+    gltf = json.loads(data[json_start:json_end].decode("utf-8"))
+
+    for idx_str, new_name in names_dict.items():
+        try:
+            idx = int(idx_str)
+        except ValueError:
+            continue
+        meshes = gltf.get("meshes") or []
+        if 0 <= idx < len(meshes):
+            meshes[idx]["name"] = new_name
+
+    for node in (gltf.get("nodes") or []):
+        mesh_idx = node.get("mesh")
+        if isinstance(mesh_idx, int) and str(mesh_idx) in names_dict:
+            node["name"] = names_dict[str(mesh_idx)]
+
+    new_json = json.dumps(gltf, separators=(",", ":")).encode("utf-8")
+    pad = (4 - len(new_json) % 4) % 4
+    new_json += b" " * pad
+
+    new_chunk  = len(new_json).to_bytes(4, "little") + (0x4E4F534A).to_bytes(4, "little") + new_json
+    rest       = data[json_chunk_start + 8 + (json_end - json_start):]
+    new_total  = 12 + len(new_chunk) + len(rest)
+    header     = b"glTF" + (2).to_bytes(4, "little") + new_total.to_bytes(4, "little")
+    return header + new_chunk + rest
+
+
+async def rename_segmented_model(segmented_path: str, hint: str = "") -> tuple[Optional[str], list[str]]:
+    """
+    Rename segments in a segmented GLB to semantic names using LLM.
+    
+    Takes a segmented GLB (with Segment_00, Segment_01, etc.) and renames
+    the mesh nodes to meaningful semantic names (head, left_arm, right_leg, etc.).
+    
+    Returns:
+      (renamed_path: str or None, semantic_names: list[str])
+        - renamed_path: Path to the output GLB (currently same as input, updates pending)
+        - semantic_names: List of semantic names generated by the renamer
+    """
+    try:
+        segmented_file = Path(segmented_path)
+        if not segmented_file.exists():
+            logger.error(f"[rename] Segmented file not found: {segmented_path}")
+            return None, []
+        
+        # Read the segmented GLB
+        with open(segmented_file, "rb") as f:
+            glb_data = f.read()
+        
+        logger.info(f"[rename] Renaming segments in {segmented_file.name} with hint: '{hint}'")
+        
+        # Call mesh_renamer to get semantic names
+        rename_result = await rename_meshes_from_file(
+            filename=segmented_file.name,
+            data=glb_data,
+            hint=hint or "anatomical structure"
+        )
+        
+        if not rename_result.get("names"):
+            logger.warning(f"[rename] No names returned from renamer")
+            return None, []
+        
+        # Extract semantic names in order of mesh index
+        names_dict = rename_result.get("names", {})
+        semantic_names = [names_dict.get(str(i), f"Segment_{i:02d}") 
+                         for i in range(len(names_dict))]
+        
+        logger.info(f"[rename] Generated semantic names: {semantic_names}")
+        
+        # Rewrite the GLB file with new node names
+        try:
+            rewritten = _rewrite_glb_with_names(glb_data, names_dict)
+            out_path = OUTPUT_DIR / segmented_file.name
+            with open(out_path, "wb") as f:
+                f.write(rewritten)
+            logger.info(f"[rename] ✅ GLB rewritten with semantic names -> {out_path}")
+            return str(out_path), semantic_names
+        except Exception as e:
+            logger.error(f"[rename] GLB rewrite failed: {e}", exc_info=True)
+            return segmented_path, semantic_names  # partial success — names generated but file unchanged
+        
+    except Exception as e:
+        logger.error(f"[rename] Failed to rename segmented model: {e}", exc_info=True)
+        return None, []
+
+
+async def segment_model(local_path: str) -> Optional[str]:
+    """
+    Run segment_glb.py on a GLB that has no named mesh nodes
+    (single-mesh / unlabelled model).
+
+    Steps:
+      1. Copy the file into app/input/<filename>
+      2. Run:  python segment_glb.py <filename>
+         The script reads from app/input/ and writes to app/output/
+      3. Return the path to the segmented GLB, or None on failure.
+    """
+    INPUT_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(exist_ok=True)
+
+    src      = Path(local_path)
+    filename = src.name
+    dst      = INPUT_DIR / filename
+
+    if src.resolve() != dst.resolve():
+        shutil.copy2(src, dst)
+    logger.info(f"[segment] Copied {filename} -> {dst}")
+
+    script = APP_DIR / "segment_mesh.py"
+    if not script.exists():
+        logger.error(f"[segment] segment_glb.py not found at {script}")
+        return None
+
+    try:
+        import subprocess
+        def _run():
+            return subprocess.run(
+                [sys.executable, str(script), filename,
+                 "--max-segments", "20",
+                 "--strategy", "auto"],
+                cwd=str(APP_DIR),
+                capture_output=True,
+                text=True
+            )
+        loop = asyncio.get_event_loop()
+        proc = await loop.run_in_executor(None, _run)
+        log_output = proc.stdout + proc.stderr
+        logger.info(f"[segment] Output:\n{log_output}")
+
+        if proc.returncode != 0:
+            logger.error(f"[segment] segment_mesh.py exited with code {proc.returncode}")
+            return None
+
+        out_path = OUTPUT_DIR / filename
+        if out_path.exists():
+            logger.info(f"[segment] Segmented model saved -> {out_path}")
+            return str(out_path)
+
+        logger.error(f"[segment] Expected output not found: {out_path}")
+        return None
+
+    except Exception as e:
+        logger.error(f"[segment] Exception: {e}", exc_info=True)
+        return None
+
+# ─── Models ───────────────────────────────────────────────────────────────────
+
+class SearchAttributes(BaseModel):
+    object_type: str
+    style: str
+    keywords: List[str]
+    refined_query: str
+    confidence: float = 1.0
+
+class ModelInfo(BaseModel):
+    type: str  # "sketchfab" | "glb" | "gltf" | "none"
+    url: Optional[str] = None
+    embed_url: Optional[str] = None
+    title: str
+    source_url: str
+    source_domain: str
+    # Sketchfab metadata
+    description: Optional[str] = None
+    tags: List[str] = []
+    categories: List[str] = []
+    vertex_count: Optional[int] = None
+    face_count: Optional[int] = None
+    animation_count: Optional[int] = None
+    is_downloadable: Optional[bool] = None
+    license: Optional[str] = None
+    author: Optional[str] = None
+    thumbnail_url: Optional[str] = None
+
+class SearchRecord(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    original_prompt: str
+    attributes: Optional[SearchAttributes] = None
+    primary_model: Optional[ModelInfo] = None
+    all_models: List[ModelInfo] = []
+    status: str = "pending"
+    error_message: Optional[str] = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class SearchRequest(BaseModel):
+    prompt: str
+
+class SearchResponse(BaseModel):
+    id: str
+    original_prompt: str
+    attributes: Optional[SearchAttributes]
+    primary_model: Optional[ModelInfo]
+    all_models: List[ModelInfo]
+    status: str
+    error_message: Optional[str]
+    created_at: str
+
+class ModelScoreRequest(BaseModel):
+    model_url: str
+    prompt: str
+    metadata: Optional[Dict[str, Any]] = None
+
+class ModelScoreResponse(BaseModel):
+    final_score: float
+    is_labelled: bool
+    decision: str  # USE / REFETCH / CACHE / DISCARD
+    semantic_score: float
+    geometric_score: float
+    details: Dict[str, Any]
+
+class BatchScoreRequest(BaseModel):
+    search_id: str
+    prompt: str
+
+class BatchScoreResponse(BaseModel):
+    search_id: str
+    ranked_models: List[Dict[str, Any]]
+    best_model: Optional[Dict[str, Any]]
+
+
+class MeshFromPromptRequest(BaseModel):
+    prompt: str
+
+
+class MeshFromPromptResponse(BaseModel):
+    prompt: str
+    selected_image_url: str
+    selected_image_bytes: int
+    output_filename: str
+    output_url: str
+    generator_endpoint: str
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def _extract_domain(url: str) -> str:
+    try:
+        from urllib.parse import urlparse
+        return urlparse(url).netloc
+    except Exception:
+        return ""
+
+def extract_sketchfab_id(url: str) -> Optional[str]:
+    patterns = [
+        r'sketchfab\.com/3d-models/[^/?#]+-([a-f0-9]{32})(?:[/?#]|$)',
+        r'sketchfab\.com/models/([a-f0-9]{32})(?:[/?#]|$)',
+    ]
+    for p in patterns:
+        m = re.search(p, url)
+        if m:
+            return m.group(1)
+    return None
+
+def is_direct_model_url(url: str) -> bool:
+    lo = url.lower().split('?')[0]
+    return lo.endswith('.glb') or lo.endswith('.gltf')
+
+# Update resolve_model_from_result to be async and fetch metadata
+async def resolve_model_from_result(result: dict) -> Optional[ModelInfo]:
+    url = result.get('url', '')
+    title = result.get('title', 'Untitled')
+    content = result.get('content', '')
+
+    # 1. Sketchfab URL
+    sf_id = extract_sketchfab_id(url)
+    if sf_id:
+        # Fetch rich metadata from Sketchfab API using the fetcher
+        sketchfab_api_key = os.environ.get('SKETCHFAB_API_KEY', '')
+        
+        try:
+            from app.sketchfab_fetcher import fetch_sketchfab_metadata as fetch_sf_meta
+            metadata_obj = await fetch_sf_meta(sf_id, sketchfab_api_key)
+            
+            if metadata_obj and metadata_obj.title:
+                return ModelInfo(
+                    type="sketchfab",
+                    url=url,  # ✅ Add source URL for fetching/downloading
+                    embed_url=f"https://sketchfab.com/models/{sf_id}/embed?autostart=1&ui_hint=0&ui_infos=0",
+                    title=metadata_obj.title or title,
+                    source_url=url,
+                    source_domain="sketchfab.com",
+                    description=metadata_obj.description,
+                    tags=metadata_obj.tags,
+                    face_count=metadata_obj.face_count,
+                    is_downloadable=metadata_obj.is_downloadable,
+                    license=metadata_obj.license,
+                    author=metadata_obj.author,
+                    thumbnail_url=metadata_obj.thumbnail_url,
+                )
+        except Exception as e:
+            logger.warning(f"Failed to fetch Sketchfab metadata for {sf_id}: {e}")
+        
+        # Fallback if API fails
+        return ModelInfo(
+            type="sketchfab",
+            url=url,  # ✅ Add source URL for fetching/downloading
+            embed_url=f"https://sketchfab.com/models/{sf_id}/embed?autostart=1&ui_hint=0&ui_infos=0",
+            title=title,
+            source_url=url,
+            source_domain="sketchfab.com",
+        )
+
+    # 2. Direct GLB/GLTF URL
+    if is_direct_model_url(url):
+        ext = "glb" if ".glb" in url.lower() else "gltf"
+        return ModelInfo(type=ext, url=url, title=title, source_url=url, source_domain=_extract_domain(url))
+
+    # 3. GLB/GLTF URL in page content
+    matches = re.findall(r'https?://[^\s"\'<>]+\.(?:glb|gltf)(?:\?[^\s"\'<>]*)?', content, re.I)
+    if matches:
+        mu = matches[0]
+        ext = "glb" if ".glb" in mu.lower() else "gltf"
+        return ModelInfo(type=ext, url=mu, title=title, source_url=url, source_domain=_extract_domain(url))
+
+    return None
+
+def record_to_response(record: dict) -> SearchResponse:
+    def _parse_attrs(a):
+        return SearchAttributes(**a) if a else None
+
+    def _parse_model(m):
+        return ModelInfo(**m) if m else None
+
+    created = record.get("created_at", datetime.now(timezone.utc))
+    if isinstance(created, datetime):
+        created_str = created.isoformat()
+    else:
+        created_str = str(created)
+
+    return SearchResponse(
+        id=record.get("id", ""),
+        original_prompt=record.get("original_prompt", ""),
+        attributes=_parse_attrs(record.get("attributes")),
+        primary_model=_parse_model(record.get("primary_model")),
+        all_models=[ModelInfo(**m) for m in record.get("all_models", [])],
+        status=record.get("status", "unknown"),
+        error_message=record.get("error_message"),
+        created_at=created_str,
+    )
+
+# ─── Services ─────────────────────────────────────────────────────────────────
+
+async def refine_prompt_with_groq(prompt: str) -> SearchAttributes:
+    system_prompt = (
+        "You are a 3D model search expert. Analyze the user's query and return JSON with:\n"
+        "- object_type: main category (vehicle, character, building, creature, weapon, furniture, nature, aircraft, robot, etc.)\n"
+        "- style: artistic style (realistic, sci-fi, cyberpunk, cartoon, low-poly, fantasy, medieval, futuristic, etc.)\n"
+        "- keywords: array of 3-6 specific search terms (most distinctive first)\n"
+        "- refined_query: concise effective search query, max 7 words\n"
+        "- confidence: float 0.0-1.0\n"
+        "Examples:\n"
+        '- "a futuristic cyberpunk motorcycle" -> {"object_type":"vehicle","style":"cyberpunk","keywords":["motorcycle","cyberpunk","futuristic","neon"],"refined_query":"cyberpunk motorcycle futuristic neon","confidence":0.95}\n'
+        '- "medieval knight in armor" -> {"object_type":"character","style":"medieval","keywords":["knight","armor","medieval","warrior"],"refined_query":"medieval knight armor warrior","confidence":0.92}'
+    )
+
+    def _call():
+        return groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+            response_format={"type": "json_object"},
+            max_tokens=512,
+            temperature=0.2,
+        )
+
+    loop = asyncio.get_event_loop()
+    response = await loop.run_in_executor(None, _call)
+    data = json.loads(response.choices[0].message.content)
+
+    return SearchAttributes(
+        object_type=data.get("object_type", "object"),
+        style=data.get("style", "realistic"),
+        keywords=data.get("keywords", [prompt]),
+        refined_query=data.get("refined_query", prompt),
+        confidence=float(data.get("confidence", 0.8)),
+    )
+
+
+async def search_models_with_tavily(attributes: SearchAttributes) -> List[ModelInfo]:
+    loop = asyncio.get_event_loop()
+
+    # Prioritize direct downloads from free model repositories
+    queries = [
+        f"{attributes.refined_query} 3d model glb gltf download site:polyhaven.com OR site:quaternius.com OR site:kenney.nl",
+        f"{attributes.refined_query} free 3d model .glb .gltf direct download CC0",
+        f"{attributes.object_type} {attributes.style} 3d asset glb gltf free download",
+        f"{attributes.refined_query} 3d model site:sketchfab.com",  # Fallback to Sketchfab last
+    ]
+
+    async def _search(query: str):
+        def _call():
+            return tavily_client.search(
+                query=query,
+                search_depth="basic",
+                max_results=5,
+                include_answer=False,
+            )
+        try:
+            result = await loop.run_in_executor(None, _call)
+            return result.get("results", [])
+        except Exception as e:
+            logger.error(f"Tavily error for '{query}': {e}")
+            return []
+
+    all_raw = await asyncio.gather(*[_search(q) for q in queries])
+
+    models = []
+    seen = set()
+    for batch in all_raw:
+        for result in batch:
+            model = await resolve_model_from_result(result)  # Add await
+            if model:
+                key = model.embed_url or model.url or model.source_url
+                if key and key not in seen:
+                    seen.add(key)
+                    models.append(model)
+
+    return models
+
+
+def _extract_image_urls(search_result: Dict[str, Any]) -> List[str]:
+    urls: List[str] = []
+
+    images = search_result.get("images") or []
+    for image_entry in images:
+        if isinstance(image_entry, str) and image_entry.startswith("http"):
+            urls.append(image_entry)
+        elif isinstance(image_entry, dict):
+            candidate = image_entry.get("url") or image_entry.get("image_url")
+            if isinstance(candidate, str) and candidate.startswith("http"):
+                urls.append(candidate)
+
+    for item in search_result.get("results", []):
+        if not isinstance(item, dict):
+            continue
+        for key in ("image", "image_url", "thumbnail"):
+            candidate = item.get(key)
+            if isinstance(candidate, str) and candidate.startswith("http"):
+                urls.append(candidate)
+
+    deduped: List[str] = []
+    seen = set()
+    for url in urls:
+        if url not in seen:
+            seen.add(url)
+            deduped.append(url)
+    return deduped
+
+
+async def _search_wikimedia_image_urls(prompt: str, max_results: int = 12) -> List[str]:
+    """Fetch candidate image URLs from Wikimedia Commons without API keys."""
+    api_url = "https://commons.wikimedia.org/w/api.php"
+    params = {
+        "action": "query",
+        "format": "json",
+        "generator": "search",
+        "gsrsearch": prompt,
+        "gsrnamespace": 6,  # File namespace
+        "gsrlimit": max_results,
+        "prop": "imageinfo",
+        "iiprop": "url|mime",
+        "origin": "*",
+    }
+
+    headers = {
+        "User-Agent": "Prompt2Mesh/1.0 (+https://github.com)",
+        "Accept": "application/json",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True, headers=headers) as client:
+            resp = await client.get(api_url, params=params)
+            if resp.status_code != 200:
+                return []
+            payload = resp.json()
+    except Exception as exc:
+        logger.warning("Wikimedia image search failed: %s", exc)
+        return []
+
+    pages = (payload.get("query") or {}).get("pages") or {}
+    urls: List[str] = []
+    for page in pages.values():
+        infos = page.get("imageinfo") or []
+        if not infos:
+            continue
+        info = infos[0]
+        mime = (info.get("mime") or "").lower()
+        if not mime.startswith("image/"):
+            continue
+        url = info.get("url")
+        if isinstance(url, str) and url.startswith("http"):
+            urls.append(url)
+
+    # De-duplicate while preserving order
+    deduped: List[str] = []
+    seen = set()
+    for url in urls:
+        if url not in seen:
+            seen.add(url)
+            deduped.append(url)
+    return deduped
+
+
+def _public_image_seed_urls(prompt: str) -> List[str]:
+    """Provide no-key image URLs as the last-resort fallback."""
+    q = re.sub(r"\s+", ",", prompt.strip())
+    seed = re.sub(r"[^a-zA-Z0-9_-]", "", prompt.lower().replace(" ", "-"))[:40] or "prompt2mesh"
+    return [
+        f"https://loremflickr.com/1600/900/{q}",
+        f"https://picsum.photos/seed/{seed}/1600/900",
+    ]
+
+
+async def _download_high_quality_image_for_prompt(prompt: str) -> tuple[bytes, str, str]:
+    loop = asyncio.get_event_loop()
+    allowed_mimes = {"image/jpeg", "image/png", "image/webp"}
+
+    search_queries = [
+        f"{prompt} high quality 3d render 8k",
+        f"{prompt} high quality 3d model reference image",
+        f"{prompt} high resolution image",
+    ]
+
+    def _tavily_search(query: str) -> Dict[str, Any]:
+        return tavily_client.search(
+            query=query,
+            search_depth="advanced",
+            max_results=8,
+            include_answer=False,
+            include_images=True,
+        )
+
+    candidate_urls: List[str] = []
+    for query in search_queries:
+        try:
+            result = await loop.run_in_executor(None, _tavily_search, query)
+            extracted = _extract_image_urls(result)
+            candidate_urls.extend(extracted)
+            if extracted:
+                # Prefer 3D-biased queries first; stop early once candidates are found.
+                break
+        except Exception as exc:
+            logger.warning("Tavily image search failed for query '%s': %s", query, exc)
+
+    if not candidate_urls:
+        logger.warning("No Tavily image candidates. Falling back to Wikimedia Commons image search.")
+        candidate_urls = await _search_wikimedia_image_urls(f"{prompt} 3d render")
+        if not candidate_urls:
+            candidate_urls = await _search_wikimedia_image_urls(prompt)
+
+    if not candidate_urls:
+        logger.warning("No Wikimedia candidates. Falling back to public seeded image providers.")
+        candidate_urls = _public_image_seed_urls(prompt)
+
+    if not candidate_urls:
+        raise HTTPException(
+            status_code=502,
+            detail="No candidate images found via Tavily or Wikimedia",
+        )
+
+    best_bytes: Optional[bytes] = None
+    best_url: Optional[str] = None
+    best_mime: str = "application/octet-stream"
+
+    download_headers = {
+        "User-Agent": "Prompt2Mesh/1.0 (+https://github.com)",
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    }
+
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, headers=download_headers) as client:
+        for image_url in candidate_urls[:12]:
+            try:
+                resp = await client.get(image_url)
+                if resp.status_code != 200:
+                    continue
+
+                content_type = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+                if not content_type.startswith("image/"):
+                    continue
+                if content_type not in allowed_mimes:
+                    continue
+
+                payload = resp.content
+                if len(payload) < 100_000:
+                    continue
+
+                if best_bytes is None or len(payload) > len(best_bytes):
+                    best_bytes = payload
+                    best_url = image_url
+                    best_mime = content_type
+            except Exception:
+                continue
+
+        # Last resort: if all fetched candidates were invalid MIME/size, try seeded public providers.
+        if not best_bytes or not best_url:
+            for image_url in _public_image_seed_urls(prompt):
+                try:
+                    resp = await client.get(image_url)
+                    if resp.status_code != 200:
+                        continue
+
+                    content_type = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+                    if content_type not in allowed_mimes:
+                        continue
+
+                    payload = resp.content
+                    if len(payload) < 100_000:
+                        continue
+
+                    best_bytes = payload
+                    best_url = image_url
+                    best_mime = content_type
+                    break
+                except Exception:
+                    continue
+
+    if not best_bytes or not best_url:
+        raise HTTPException(status_code=502, detail="Could not download a suitable high-quality image")
+
+    return best_bytes, best_url, best_mime
+
+
+async def _generate_mesh_file_from_prompt(prompt: str) -> tuple[Path, str, int, str]:
+    """
+    Generate a GLB from prompt via the mesh generation API and persist it in OUTPUT_DIR.
+
+    Returns:
+        (output_path, selected_image_url, selected_image_bytes, generator_endpoint)
+    """
+    image_bytes, image_url, image_mime = await _download_high_quality_image_for_prompt(prompt)
+
+    mesh_api_url = os.environ.get("MESH_GENERATOR_URL", "http://98.70.40.74:8000/generate-mesh")
+    extension = mimetypes.guess_extension(image_mime) or ".jpg"
+    upload_name = f"source_{uuid.uuid4().hex}{extension}"
+
+    async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+        try:
+            response = await client.post(
+                mesh_api_url,
+                files={"file": (upload_name, image_bytes, image_mime)},
+            )
+        except Exception as exc:
+            logger.error("Mesh generation API request failed: %s", exc, exc_info=True)
+            raise HTTPException(status_code=502, detail="Mesh generation API is unreachable") from exc
+
+    if response.status_code != 200:
+        detail = response.text[:500]
+        raise HTTPException(
+            status_code=502,
+            detail=f"Mesh generation API failed with {response.status_code}: {detail}",
+        )
+
+    output_filename = f"model_{uuid.uuid4().hex}.glb"
+    output_path = OUTPUT_DIR / output_filename
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    async with aiofiles.open(output_path, "wb") as f:
+        await f.write(response.content)
+
+    return output_path, image_url, len(image_bytes), mesh_api_url
+
+
+async def _segment_and_rename_generated_model(glb_path: Path, hint: str) -> tuple[Path, list[str]]:
+    """Apply the same segment -> rename flow used for approved unlabelled models."""
+    segmented_path = await segment_model(str(glb_path))
+    if not segmented_path:
+        logger.warning("[fallback] Segmentation failed for generated mesh; using raw generated model")
+        return glb_path, []
+
+    renamed_path, semantic_names = await rename_segmented_model(segmented_path, hint=hint)
+    if renamed_path:
+        return Path(renamed_path), semantic_names
+
+    logger.warning("[fallback] Renaming failed for generated mesh; using segmented output")
+    return Path(segmented_path), []
+
+# ─── Routes ───────────────────────────────────────────────────────────────────
+
+@api_router.post("/search", response_model=SearchResponse)
+async def search_models(request: SearchRequest, http_request: Request):
+    prompt = request.prompt.strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Prompt cannot be empty")
+
+    # Cache check: same prompt within 24 hours
+    cache_cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+    cached = await db.searches.find_one(
+        {
+            "original_prompt": {"$regex": f"^{re.escape(prompt)}$", "$options": "i"},
+            "status": {"$in": ["completed", "no_model"]},
+            "created_at": {"$gte": cache_cutoff},
+        },
+        {"_id": 0},
+    )
+    if cached:
+        logger.info(f"Cache hit: {prompt}")
+        return record_to_response(cached)
+
+    record = SearchRecord(original_prompt=prompt)
+    doc = record.model_dump()
+    doc["created_at"] = doc["created_at"].isoformat()
+    await db.searches.insert_one(doc)
+
+    try:
+        attributes = await refine_prompt_with_groq(prompt)
+        models = await search_models_with_tavily(attributes)
+        
+        if not models:
+            logger.warning(f"No existing models found for '{prompt}'. Will trigger mesh-generation fallback.")
+            
+        # ─── SCORING & DECISION GATES ───────────────────────────────────────
+        logger.info(f"\n{'='*80}")
+        logger.info(f"Found {len(models)} models, starting scoring pipeline...")
+        logger.info(f"{'='*80}")
+        for idx, m in enumerate(models[:5], 1):
+            logger.info(f"  [{idx}] {m.title[:60]} | Type: {m.type} | URL: {m.url}")
+        logger.info(f"{'='*80}\n")
+        
+        sketchfab_api_key = os.environ.get('SKETCHFAB_API_KEY', '')
+        if not sketchfab_api_key:
+            logger.warning("⚠️  SKETCHFAB_API_KEY not set - downloadable models will be skipped!")
+        
+        scored_models = []
+        all_scoring_results = []  # Track all models for summary
+
+        # Keep fetching until 5 scorable models found or 15 attempts made
+        MAX_ATTEMPTS  = 15
+        TARGET_SCORED = 5
+        attempts      = 0
+        scored_count  = 0
+
+        for model in models[:MAX_ATTEMPTS]:
+            if scored_count >= TARGET_SCORED:
+                break
+            attempts += 1
+            i = attempts
+
+            model_url = model.url
+            if not model_url:
+                continue
+                
+            try:
+                logger.info(f"[{i}/{min(len(models), 5)}] Fetching {model_url}")
+                
+                # Download model
+                fetch_result = await fetch_model(
+                    url=model_url,
+                    sketchfab_api_key=sketchfab_api_key
+                )
+                
+                logger.info(f"[{i}/{min(len(models), 5)}] Fetch status: {fetch_result.status.value}, is_scorable: {fetch_result.is_scorable}, local_path: {fetch_result.local_path}")
+                
+                # Only score if successfully fetched
+                if fetch_result.is_scorable and fetch_result.local_path:
+                    # fetch_result.metadata is already a dict with title, description, tags
+                    metadata = fetch_result.metadata if fetch_result.metadata else {
+                        "title": model.title,
+                        "description": model.description or "",
+                        "tags": model.tags,
+                    }
+                    
+                    logger.info(f"[{i}/{min(len(models), 5)}] Scoring model...")
+                    
+                    # Run scoring in thread pool
+                    loop = asyncio.get_event_loop()
+                    score_result = await loop.run_in_executor(
+                        None,
+                        score_model,
+                        str(fetch_result.local_path),
+                        prompt,
+                        metadata
+                    )
+                    
+                    # Log detailed scoring breakdown
+                    logger.info(f"\n{'='*70}")
+                    logger.info(f"[{i}/{min(len(models), 5)}] SCORING RESULT: {model.title[:50]}")
+                    logger.info(f"{'='*70}")
+                    logger.info(f"  Semantic Score:  {score_result.semantic.combined:.4f} (CLIP: {score_result.semantic.clip_score:.4f}, Metadata: {score_result.semantic.metadata_score:.4f})")
+                    logger.info(f"  Geometric Score: {score_result.geometric.combined:.4f}")
+                    logger.info(f"  Final Score:     {score_result.final_score:.4f} = {SEMANTIC_WEIGHT:.1f}×{score_result.semantic.combined:.4f} + {GEOMETRIC_WEIGHT:.1f}×{score_result.geometric.combined:.4f}")
+                    logger.info(f"  Is Labelled:     {score_result.is_labelled}")
+                    logger.info(f"  Decision:        {score_result.decision}")
+                    logger.info(f"-" * 70)
+                    
+                    # Store all results for summary
+                    all_scoring_results.append({
+                        "title": model.title[:40],
+                        "score": score_result.final_score,
+                        "semantic": score_result.semantic.combined,
+                        "geometric": score_result.geometric.combined,
+                        "labelled": score_result.is_labelled,
+                        "decision": score_result.decision,
+                    })
+                    
+                    # Apply decision gates - only USE and CACHE models are shown
+                    # New decision gate logic: SEGMENT_MESH / USE / RENAME / PENDING
+                    if score_result.decision == "SEGMENT_MESH":
+                        # Single mesh: segment it, apply semantic naming, ready to use
+                        logger.info(f"  ✅ SEGMENT_MESH: Score {score_result.final_score:.4f} ≥ 0.5, single node")
+                        logger.info(f"     → Segmenting mesh and creating semantic names...")
+                        
+                        segmented_path = await segment_model(str(fetch_result.local_path))
+                        if segmented_path:
+                            logger.info(f"     [segment] ✅ Done: {segmented_path}")
+                            
+                            # Rename segments to semantic names using original prompt as hint
+                            logger.info("     [rename] Applying semantic naming to segments ...")
+                            renamed_path, semantic_names = await rename_segmented_model(
+                                segmented_path, 
+                                hint=", ".join(attributes.keywords) if attributes.keywords else prompt
+                            )
+                            if renamed_path:
+                                logger.info(f"     [rename] ✅ Segments renamed: {semantic_names}")
+                                final_path = renamed_path
+                                # Update node_names with semantic names for conversation service
+
+                            else:
+                                logger.warning("     [rename] ⚠️  Renaming failed, using original segments")
+                                final_path = segmented_path
+                                semantic_names = []
+                            
+                            model = ModelInfo(
+                                **{**model.model_dump(),
+                                   "url": f"/api/output/{Path(final_path).name}",
+                                   "description": (model.description or "") + " [segmented + renamed]"}
+                            )
+                            
+                            scored_models.append({
+                                "model": model,
+                                "score": score_result.final_score,
+                                "decision": score_result.decision,
+                                "is_labelled": True,  # Now has semantic node names
+                                "node_names": semantic_names,
+                                "semantic_score": score_result.semantic.combined,
+                                "geometric_score": score_result.geometric.combined,
+                            })
+                            scored_count += 1
+                            logger.info(f"  📦 Node names ({len(semantic_names)}): {semantic_names}")
+                        else:
+                            logger.warning("     [segment] ⚠️  Failed — skipping this model")
+                    
+                    elif score_result.decision == "USE":
+                        logger.info(f"  ✅ USE: Score {score_result.final_score:.4f} ≥ 0.5, well-defined labels")
+                        logger.info(f"     → Copying to output for Three.js rendering ...")
+
+                        final_path = _copy_to_output(str(fetch_result.local_path))
+                        node_names = getattr(score_result, "node_names", []) or []
+
+                        model = ModelInfo(
+                            **{**model.model_dump(),
+                               "type": "glb",
+                               "url": f"/api/output/{Path(final_path).name}",
+                               "description": (model.description or "") + " [used directly]"}
+                        )
+                        scored_models.append({
+                            "model": model,
+                            "score": score_result.final_score,
+                            "decision": score_result.decision,
+                            "is_labelled": score_result.is_labelled,
+                            "node_names": node_names,
+                            "semantic_score": score_result.semantic.combined,
+                            "geometric_score": score_result.geometric.combined,
+                        })
+                        scored_count += 1
+                        logger.info(f"  📦 Node names ({len(node_names)}): {node_names}")
+                    
+                    elif score_result.decision == "RENAME":
+                        # Multiple nodes with poorly-defined labels: fix with renamer
+                        logger.info(f"  ⚠️  RENAME: Score {score_result.final_score:.4f} ≥ 0.5, poorly-defined labels")
+                        logger.info(f"     → Labels need semantic refinement via mesh_renamer...")
+                        
+                        # Call renamer to fix the labels
+                        logger.info("     [rename] Refining node labels with semantic naming...")
+                        renamed_path, semantic_names = await rename_segmented_model(
+                            str(fetch_result.local_path),
+                            hint=prompt or "anatomical structure"
+                        )
+                        
+                        if renamed_path:
+                            logger.info(f"     [rename] ✅ Labels refined: {semantic_names}")
+                            final_path = renamed_path
+                        else:
+                            logger.warning("     [rename] ⚠️  Renaming failed — copying original to output")
+                            final_path = _copy_to_output(str(fetch_result.local_path))
+                            semantic_names = getattr(score_result, "node_names", []) or []
+
+                        model = ModelInfo(
+                            **{**model.model_dump(),
+                               "type": "glb",
+                               "url": f"/api/output/{Path(final_path).name}",
+                               "description": (model.description or "") + " [labels refined]"}
+                        )
+                        
+                        scored_models.append({
+                            "model": model,
+                            "score": score_result.final_score,
+                            "decision": score_result.decision,
+                            "is_labelled": True,  # Now has refined labels
+                            "node_names": semantic_names,
+                            "semantic_score": score_result.semantic.combined,
+                            "geometric_score": score_result.geometric.combined,
+                        })
+                        scored_count += 1
+                        logger.info(f"  📦 Node names ({len(semantic_names)}): {semantic_names}")
+                    
+                    elif score_result.decision == "PENDING":
+                        # Score < 0.5: awaiting user definition
+                        logger.info(f"  ⏸️  PENDING: Score {score_result.final_score:.4f} < 0.5")
+                        logger.info(f"     → Score below threshold. Skipping for now (awaiting threshold definition).")
+                    
+                    logger.info(f"{'='*70}\n")
+                
+                else:
+                    # Model fetched but not scorable
+                    logger.warning(f"[{i}/{min(len(models), 5)}] ⚠️  Model NOT SCORABLE")
+                    logger.warning(f"     Status: {fetch_result.status.value}")
+                    logger.warning(f"     Reason: is_scorable={fetch_result.is_scorable}, has_local_path={bool(fetch_result.local_path)}")
+                    if fetch_result.status.value == "NOT_DOWNLOADABLE":
+                        logger.warning(f"     → Model is view-only (Sketchfab embed without download permission)")
+                    elif fetch_result.status.value == "DOWNLOAD_FAILED":
+                        logger.warning(f"     → Download failed - model may require authentication or be deleted")
+                    
+            except Exception as e:
+                logger.error(f"[{i}/{min(len(models), 5)}] ❌ EXCEPTION during fetch/score: {type(e).__name__}: {e}", exc_info=True)
+                continue
+        
+        # Sort by score (highest first)
+        scored_models.sort(key=lambda x: x["score"], reverse=True)
+        
+        # Extract approved models
+        approved_models = [item["model"] for item in scored_models]
+        primary = approved_models[0] if approved_models else None
+        
+        # ─── SCORING SUMMARY TABLE ───
+        logger.info(f"\n{'='*90}")
+        logger.info(f"  SCORING SUMMARY - {len(all_scoring_results)} MODELS EVALUATED")
+        logger.info(f"{'='*90}")
+        logger.info(f"  {'Model':<40} {'Final':<8} {'Sem':<7} {'Geo':<7} {'Labelled':<10} {'Decision':<10}")
+        logger.info(f"  {'-'*40} {'-'*8} {'-'*7} {'-'*7} {'-'*10} {'-'*10}")
+        
+        for result in all_scoring_results:
+            decision_symbol = "✅" if result["decision"] in ["USE", "SEGMENT_MESH", "RENAME"] else "❌"
+            labelled_str = "Yes" if result["labelled"] else "No"
+            logger.info(
+                f"  {result['title']:<40} {result['score']:.4f}   "
+                f"{result['semantic']:.4f}  {result['geometric']:.4f}  "
+                f"{labelled_str:<10} {decision_symbol} {result['decision']:<10}"
+            )
+        
+        logger.info(f"{'='*90}")
+        logger.info(f"  THRESHOLDS: Labelled models need >{THRESHOLD_LABELLED:.2f} | Unlabelled models need >{THRESHOLD_UNLABELLED:.2f}")
+        logger.info(f"  RESULT: {len(scored_models)} APPROVED / {len(all_scoring_results)} EVALUATED / {attempts} ATTEMPTED")
+        logger.info(f"{'='*90}\n")
+        
+        # ─── FALLBACK STRATEGY: Generate model if none approved (includes score < 0.5) ───
+        if not approved_models:
+            logger.warning("⚠️  No approved model available. Triggering mesh-generation fallback.")
+
+            try:
+                generated_path, image_url, image_bytes, generator_endpoint = await _generate_mesh_file_from_prompt(prompt)
+                logger.info(f"[fallback] Generated base mesh: {generated_path}")
+
+                rename_hint = ", ".join(attributes.keywords) if attributes.keywords else prompt
+                final_path, semantic_names = await _segment_and_rename_generated_model(generated_path, hint=rename_hint)
+
+                output_url = str(http_request.url_for("serve_output_file", filename=final_path.name))
+                primary = ModelInfo(
+                    type="glb",
+                    url=output_url,
+                    title=f"Generated: {prompt}",
+                    source_url=generator_endpoint,
+                    source_domain="mesh-generator",
+                    description=(
+                        f"Generated via fallback mesh API from image: {image_url} "
+                        f"({image_bytes} bytes), then segmented/renamed"
+                    ),
+                    tags=attributes.keywords,
+                )
+
+                approved_models = [primary]
+                scored_models.append(
+                    {
+                        "model": primary,
+                        "score": 0.0,
+                        "decision": "GENERATED_FALLBACK",
+                        "is_labelled": bool(semantic_names),
+                        "node_names": semantic_names,
+                        "semantic_score": 0.0,
+                        "geometric_score": 0.0,
+                    }
+                )
+                status = "completed"
+            except Exception as e:
+                logger.error(f"❌ Mesh-generation fallback failed: {e}", exc_info=True)
+                status = "no_model"
+        else:
+            status = "completed"
+
+        update = {
+            "attributes": attributes.model_dump(),
+            "primary_model": primary.model_dump() if primary else None,
+            "all_models": [m.model_dump() for m in approved_models],
+            "scored_results": [
+                {
+                    "model": item["model"].model_dump(),  # Convert ModelInfo to dict
+                    "score": item["score"],
+                    "decision": item["decision"],
+                    "is_labelled": item["is_labelled"],
+                    "node_names": item.get("node_names", []),
+                    "semantic_score": item["semantic_score"],
+                    "geometric_score": item["geometric_score"],
+                }
+                for item in scored_models
+            ],
+            "status": status,
+        }
+        await db.searches.update_one({"id": record.id}, {"$set": update})
+
+        return SearchResponse(
+            id=record.id,
+            original_prompt=prompt,
+            attributes=attributes,
+            primary_model=primary,
+            all_models=approved_models,
+            status=status,
+            error_message=None,
+            created_at=record.created_at.isoformat(),
+        )
+
+    except Exception as e:
+        logger.error(f"Search error: {e}", exc_info=True)
+        await db.searches.update_one(
+            {"id": record.id},
+            {"$set": {"status": "failed", "error_message": str(e)}},
+        )
+        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
+
+
+@api_router.get("/history", response_model=List[SearchResponse])
+async def get_history(limit: int = Query(default=20, le=50)):
+    records = await (
+        db.searches
+        .find({"status": {"$in": ["completed", "no_model"]}}, {"_id": 0})
+        .sort("created_at", -1)
+        .limit(limit)
+        .to_list(limit)
+    )
+    return [record_to_response(r) for r in records]
+
+
+@api_router.get("/history/{search_id}", response_model=SearchResponse)
+async def get_history_item(search_id: str):
+    record = await db.searches.find_one({"id": search_id}, {"_id": 0})
+    if not record:
+        raise HTTPException(status_code=404, detail="Search not found")
+    return record_to_response(record)
+
+
+@api_router.delete("/history/{search_id}")
+async def delete_history_item(search_id: str):
+    result = await db.searches.delete_one({"id": search_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Search not found")
+    return {"message": "Deleted"}
+
+
+@api_router.post("/chat", response_model=ChatResponse)
+async def model_chat(request: ChatRequest):
+    return await handle_model_chat(
+        request=request,
+        db=db,
+        groq_client=groq_client,
+        logger=logger,
+    )
+
+
+@api_router.get("/")
+async def root():
+    return {"message": "3D Model Discovery API", "version": "1.0"}
+
+@api_router.get("/download")
+async def download_model(url: str, background_tasks: BackgroundTasks):
+    from app.sketchfab_fetcher import fetch_model
+    from dotenv import load_dotenv
+    load_dotenv(ROOT_DIR / '.env', override=True)
+    sketchfab_api_key = os.environ.get('SKETCHFAB_API_KEY', '')
+    
+    result = await fetch_model(url, sketchfab_api_key)
+    
+    if not result.local_path or not os.path.exists(result.local_path):
+        raise HTTPException(status_code=400, detail=f"Could not download model: {result.error}")
+        
+    filename = os.path.basename(result.local_path)
+    
+    return FileResponse(
+        path=result.local_path, 
+        filename=filename, 
+        media_type='application/octet-stream'
+    )
+
+@api_router.get("/output/{filename}")
+async def serve_output_file(filename: str):
+    """Serve segmented GLB files from app/output/ over HTTP."""
+    file_path = OUTPUT_DIR / filename
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail=f"File not found: {filename}")
+    return FileResponse(
+        path=str(file_path),
+        filename=filename,
+        media_type="model/gltf-binary"
+    )
+
+@api_router.post("/mesh/rename")
+async def mesh_rename(file: UploadFile = File(...), hint: str = Form(default="")):
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Missing file name")
+
+    try:
+        data = await file.read()
+        result = await rename_meshes_from_file(file.filename, data, hint=hint or "")
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error("Mesh rename error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@api_router.post("/generate-mesh-from-prompt", response_model=MeshFromPromptResponse)
+async def generate_mesh_from_prompt(request: MeshFromPromptRequest, http_request: Request):
+    prompt = request.prompt.strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Prompt cannot be empty")
+
+    generated_path, image_url, image_bytes, mesh_api_url = await _generate_mesh_file_from_prompt(prompt)
+    final_path, _ = await _segment_and_rename_generated_model(generated_path, hint=prompt)
+
+    output_url = str(http_request.url_for("serve_output_file", filename=final_path.name))
+
+    return MeshFromPromptResponse(
+        prompt=prompt,
+        selected_image_url=image_url,
+        selected_image_bytes=image_bytes,
+        output_filename=final_path.name,
+        output_url=output_url,
+        generator_endpoint=mesh_api_url,
+    )
+# ─── Model Scoring Routes ─────────────────────────────────────────────────────
+
+@api_router.post("/score", response_model=ModelScoreResponse)
+async def score_single_model(request: ModelScoreRequest):
+    """
+    Score a single 3D model using the composite scorer.
+    Supports both direct GLB/GLTF URLs and Sketchfab URLs with download API.
+    """
+    try:
+        # Get Sketchfab API key from environment
+        sketchfab_api_key = os.environ.get('SKETCHFAB_API_KEY', '')
+        
+        # Fetch the model using the comprehensive fetcher
+        fetch_result = await fetch_model(
+            url=request.model_url,
+            sketchfab_api_key=sketchfab_api_key
+        )
+        
+        # Check if model was successfully fetched
+        if not fetch_result.is_scorable or not fetch_result.local_path:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Model could not be downloaded: {fetch_result.status.value}"
+            )
+        
+        # Prepare metadata for scorer
+        metadata = request.metadata or {}
+        if fetch_result.metadata:
+            # Merge metadata from Sketchfab API
+            metadata = {
+                "title": fetch_result.metadata.title or metadata.get("title", ""),
+                "description": fetch_result.metadata.description or metadata.get("description", ""),
+                "tags": fetch_result.metadata.tags or metadata.get("tags", []),
+            }
+        else:
+            # Use provided metadata
+            metadata = {
+                "title": metadata.get("title", ""),
+                "description": metadata.get("description", ""),
+                "tags": metadata.get("tags", []),
+            }
+        
+        # Run scorer in thread pool (CPU-intensive)
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            score_model,
+            str(fetch_result.local_path),
+            request.prompt,
+            metadata
+        )
+        
+        # Clean up temp file (fetcher may have cached it, but respect our own cleanup)
+        # Note: fetcher may cache files, so we don't always want to delete
+        # For now, let the fetcher handle caching
+        
+        return ModelScoreResponse(
+            final_score=result.final_score,
+            is_labelled=result.is_labelled,
+            decision=result.decision,
+            semantic_score=result.semantic.combined,
+            geometric_score=result.geometric.combined,
+            details={
+                "semantic": {
+                    "clip_score": result.semantic.clip_score,
+                    "metadata_score": result.semantic.metadata_score,
+                },
+                "geometric": {
+                    "polygon_density": result.geometric.polygon_density,
+                    "mesh_node_count": result.geometric.mesh_node_count,
+                    "node_hierarchy_depth": result.geometric.node_hierarchy_depth,
+                    "uv_coverage": result.geometric.uv_coverage,
+                    "material_diversity": result.geometric.material_diversity,
+                }
+            }
+        )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Scoring error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Scoring failed: {str(e)}")
+
+
+@api_router.post("/score/batch", response_model=BatchScoreResponse)
+async def score_search_results(request: BatchScoreRequest):
+    """
+    Score all models from a search result and rank them.
+    Supports direct GLB/GLTF URLs and Sketchfab download API.
+    """
+    # Get search record
+    record = await db.searches.find_one({"id": request.search_id}, {"_id": 0})
+    if not record:
+        raise HTTPException(status_code=404, detail="Search not found")
+    
+    all_models = record.get("all_models", [])
+    if not all_models:
+        raise HTTPException(status_code=404, detail="No models found in this search")
+    
+    # Get Sketchfab API key
+    sketchfab_api_key = os.environ.get('SKETCHFAB_API_KEY', '')
+    
+    logger.info(f"Attempting to score {len(all_models)} models from search {request.search_id}")
+    
+    try:
+        # Prepare candidates for batch scoring
+        candidates = []
+        
+        for model in all_models:
+            model_url = model.get("url")
+            if not model_url:
+                continue
+                
+            try:
+                # Use fetcher to download model (supports both direct URLs and Sketchfab)
+                fetch_result = await fetch_model(
+                    url=model_url,
+                    sketchfab_api_key=sketchfab_api_key
+                )
+                
+                # Only add if successfully fetched
+                if fetch_result.is_scorable and fetch_result.local_path:
+                    metadata = {}
+                    if fetch_result.metadata:
+                        metadata = {
+                            "title": fetch_result.metadata.title,
+                            "description": fetch_result.metadata.description,
+                            "tags": fetch_result.metadata.tags,
+                        }
+                    else:
+                        metadata = {
+                            "title": model.get("title", ""),
+                            "description": model.get("description", ""),
+                            "tags": model.get("tags", []),
+                        }
+                    
+                    candidates.append({
+                        "model_path": str(fetch_result.local_path),
+                        "metadata": metadata,
+                        "original_model_info": model
+                    })
+                else:
+                    logger.warning(f"Skipped {model_url}: {fetch_result.status.value}")
+                    
+            except Exception as e:
+                logger.warning(f"Failed to fetch {model_url}: {e}")
+                continue
+        
+        if not candidates:
+            raise HTTPException(
+                status_code=400,
+                detail="No models could be downloaded for scoring"
+            )
+        
+        logger.info(f"Successfully fetched {len(candidates)} models, starting batch scoring")
+        
+        # Run batch scoring in thread pool
+        loop = asyncio.get_event_loop()
+        ranked = await loop.run_in_executor(
+            None,
+            score_candidates,
+            candidates,
+            request.prompt
+        )
+        
+        # Merge scores with original model info
+        for rank_result in ranked:
+            original_info = next(
+                (c["original_model_info"] for c in candidates 
+                 if c["model_path"] == rank_result.get("model_path")),
+                None
+            )
+            if original_info:
+                rank_result["model_info"] = original_info
+        
+        best_model = ranked[0] if ranked else None
+        
+        # Update search record with scores
+        await db.searches.update_one(
+            {"id": request.search_id},
+            {"$set": {"scored_models": ranked, "best_scored_model": best_model}}
+        )
+        
+        return BatchScoreResponse(
+            search_id=request.search_id,
+            ranked_models=ranked,
+            best_model=best_model
+        )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Batch scoring error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Batch scoring failed: {str(e)}")
+
+
+# ─── Blender MCP Models ───────────────────────────────────────────────────────
+
+class BlenderConnectRequest(BaseModel):
+    command: str = "uvx"
+    args: List[str] = ["blender-mcp"]
+
+
+class ToolCallInfo(BaseModel):
+    tool: str
+    input: Dict[str, Any]
+    result: str
+
+
+class BlenderChatRequest(BaseModel):
+    message: str
+    conversation_id: Optional[str] = None
+
+
+class BlenderChatResponse(BaseModel):
+    response: str
+    tool_calls: List[ToolCallInfo]
+    conversation_id: str
+    glb_path: Optional[str] = None
+
+
+# ─── Blender MCP Routes ───────────────────────────────────────────────────────
+
+@api_router.post("/blender/connect")
+async def blender_connect(request: BlenderConnectRequest = BlenderConnectRequest()):
+    """
+    Start the Blender MCP server subprocess and connect to it.
+    Blender must already be running with the blender-mcp addon enabled.
+    """
+    if blender_client.is_connected:
+        return {
+            "status": "already_connected",
+            "tools": blender_client.tools,
+        }
+    try:
+        tools = await blender_client.connect(
+            command=request.command, args=request.args
+        )
+        return {"status": "connected", "tools": tools}
+    except Exception as exc:
+        logger.error("Blender MCP connect error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@api_router.post("/blender/disconnect")
+async def blender_disconnect():
+    """Disconnect from the Blender MCP server."""
+    if not blender_client.is_connected:
+        return {"status": "not_connected"}
+    try:
+        await blender_client.disconnect()
+        return {"status": "disconnected"}
+    except Exception as exc:
+        logger.error("Blender MCP disconnect error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@api_router.get("/blender/status")
+async def blender_status():
+    """Return connection status and available tools."""
+    return {
+        "connected": blender_client.is_connected,
+        "tools": blender_client.tools if blender_client.is_connected else [],
+        "conversations": conversation_store.list_ids(),
+    }
+
+
+@api_router.get("/blender/tools")
+async def blender_tools():
+    """List all tools exposed by the connected Blender MCP server."""
+    if not blender_client.is_connected:
+        raise HTTPException(
+            status_code=503,
+            detail="Not connected to Blender MCP server. POST /api/blender/connect first.",
+        )
+    return {"tools": blender_client.tools}
+
+
+@api_router.post("/blender/chat", response_model=BlenderChatResponse)
+async def blender_chat(request: BlenderChatRequest):
+    """
+    Send a natural-language message to Claude.  Claude has access to all
+    Blender MCP tools and will call them automatically to fulfil the request.
+
+    Pass `conversation_id` to continue an existing conversation; omit it (or
+    pass null) to start a new one.  The returned `conversation_id` should be
+    forwarded in subsequent requests.
+    """
+    if not blender_client.is_connected:
+        raise HTTPException(
+            status_code=503,
+            detail="Not connected to Blender MCP server. POST /api/blender/connect first.",
+        )
+
+    message = request.message.strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Message cannot be empty.")
+
+    conversation_id = request.conversation_id or str(uuid.uuid4())
+
+    try:
+        result = await blender_client.chat(
+            user_message=message,
+            conversation_id=conversation_id,
+        )
+        return BlenderChatResponse(
+            response=result["response"],
+            tool_calls=[ToolCallInfo(**tc) for tc in result["tool_calls"]],
+            conversation_id=result["conversation_id"],
+            glb_path=result.get("glb_path"),
+        )
+    except Exception as exc:
+        logger.error("Blender chat error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@api_router.delete("/blender/conversation/{conversation_id}")
+async def blender_clear_conversation(conversation_id: str):
+    """Clear a conversation's history."""
+    conversation_store.clear(conversation_id)
+    return {"status": "cleared", "conversation_id": conversation_id}
+
+
+app.include_router(api_router)
+
+
+@app.on_event("shutdown")
+async def shutdown_db():
+    db_client.close()
+    if blender_client.is_connected:
+        await blender_client.disconnect()

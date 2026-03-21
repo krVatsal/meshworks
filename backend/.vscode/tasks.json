@@ -1,0 +1,11 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Start Backend API Server",
+			"type": "shell",
+			"command": "cd d:\\Desktop\\SankalpAI\\Prompt2Mesh\\backend && python main.py",
+			"isBackground": false
+		}
+	]
+}
