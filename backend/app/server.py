@@ -92,32 +92,68 @@ async def get_segment_narration(search_id: str):
     )
     node_names = primary_result.get("node_names", []) if primary_result else []
 
+    # If node_names in DB are empty or look like raw boilerplate,
+    # read mesh names directly from the GLB file on disk
+    boilerplate = {"sketchfab_model", "root", "gltf_scenerootnode", "rootnode", "world"}
+    meaningful_check = [
+        n for n in node_names
+        if n.lower() not in boilerplate
+        and not n.lower().startswith("object_")
+        and not n.lower().startswith("gltf_created")
+    ]
+
+    if len(meaningful_check) < 3:
+        # Read from GLB directly
+        primary_url = primary.get("url", "")
+        if primary_url.startswith("/api/output/"):
+            glb_filename = primary_url.split("/api/output/")[-1]
+            glb_path = OUTPUT_DIR / glb_filename
+            if glb_path.exists():
+                try:
+                    with open(glb_path, "rb") as f:
+                        glb_data = f.read()
+                    gltf = json.loads(
+                        glb_data[
+                            int.from_bytes(glb_data[12:16], "little") + 20:
+                            int.from_bytes(glb_data[12:16], "little") + 20 +
+                            int.from_bytes(glb_data[
+                                int.from_bytes(glb_data[12:16], "little") + 20 - 8:
+                                int.from_bytes(glb_data[12:16], "little") + 20 - 4
+                            ], "little")
+                        ].decode("utf-8")
+                    )
+                except Exception:
+                    # Simpler fallback parse
+                    try:
+                        offset = 12
+                        while offset + 8 <= len(glb_data):
+                            chunk_len = int.from_bytes(glb_data[offset:offset+4], "little")
+                            chunk_type = int.from_bytes(glb_data[offset+4:offset+8], "little")
+                            if chunk_type == 0x4E4F534A:
+                                gltf = json.loads(glb_data[offset+8:offset+8+chunk_len].decode("utf-8"))
+                                break
+                            offset += 8 + chunk_len
+                    except Exception:
+                        gltf = {}
+
+                mesh_names = [m.get("name", f"mesh_{i}") for i, m in enumerate(gltf.get("meshes") or [])]
+                if mesh_names:
+                    node_names = mesh_names
+                    logger.info(f"[narration] Read {len(node_names)} mesh names from GLB file")
+
     if not node_names:
         raise HTTPException(status_code=404, detail="No segments found")
 
-    # Filter out rig bones, numbered variants, and technical nodes
-    def is_meaningful(name: str) -> bool:
-        n = name.lower()
-        # Skip Sketchfab boilerplate
-        if any(skip in n for skip in ["sketchfab", "gltf", "rootnode", "root", "object_", "gltf_created"]):
-            return False
-        # Skip numbered bone variants like f_pinky.02.L, brow.T.R.001
-        if re.search(r'\.\d+', name):
-            return False
-        # Skip pure index suffixes like spine_131, jaw_11
-        if re.search(r'_\d+$', name):
-            return False
-        return True
+    # Deduplicate preserving order, cap at 30 for token budget
+    seen = set()
+    unique_names = []
+    for n in node_names:
+        if n not in seen:
+            seen.add(n)
+            unique_names.append(n)
+    node_names = unique_names[:30]
 
-    meaningful = [n for n in node_names if is_meaningful(n)]
-
-    # If filtering too aggressive, fall back to first 30 original names
-    if len(meaningful) < 3:
-        meaningful = node_names[:30]
-
-    # Cap at 30 to stay within token budget
-    node_names = meaningful[:30]
-
+    logger.info(f"[narration] Sending these node_names to LLM: {node_names}")
     prompt_context = record.get("original_prompt", "3D model")
     attributes = record.get("attributes") or {}
     object_type = attributes.get("object_type", "object")
@@ -829,6 +865,84 @@ async def search_models(request: SearchRequest, http_request: Request):
     doc["created_at"] = doc["created_at"].isoformat()
     await db.searches.insert_one(doc)
 
+    # ─── TEST MODEL SHORTCUT ──────────────────────────────────────────────────
+    TEST_MODELS_DIR = APP_DIR / "test_models"
+    test_glb_name = prompt.strip().lower().replace(" ", "_") + ".glb"
+    test_glb_path = TEST_MODELS_DIR / test_glb_name
+
+    if test_glb_path.exists():
+        logger.info(f"[test] Found test model: {test_glb_path} — skipping search and scoring")
+        try:
+            attributes = await refine_prompt_with_groq(prompt)
+            rename_context = _build_rename_context(
+                prompt=prompt,
+                attributes=attributes,
+                model=ModelInfo(
+                    type="glb",
+                    title=prompt,
+                    source_url="local",
+                    source_domain="test_models",
+                    description=f"Test model for: {prompt}",
+                    tags=attributes.keywords,
+                ),
+            )
+
+            segmented_path = await segment_model(str(test_glb_path))
+            if segmented_path:
+                renamed_path, semantic_names = await rename_segmented_model(
+                    segmented_path,
+                    hint=f"{prompt} — this is a {attributes.object_type}. Expected parts: {', '.join(attributes.keywords)}.",
+                    context=rename_context,
+                )
+                final_path = renamed_path or segmented_path
+                semantic_names = semantic_names or []
+            else:
+                final_path = _copy_to_output(str(test_glb_path))
+                semantic_names = []
+
+            output_filename = Path(final_path).name
+            primary = ModelInfo(
+                type="glb",
+                url=f"/api/output/{output_filename}",
+                title=prompt,
+                source_url=f"/api/output/{output_filename}",
+                source_domain="test_models",
+                description=f"Test model: {prompt}",
+                tags=attributes.keywords,
+            )
+
+            update = {
+                "attributes": attributes.model_dump(),
+                "primary_model": primary.model_dump(),
+                "all_models": [primary.model_dump()],
+                "scored_results": [{
+                    "model": primary.model_dump(),
+                    "score": 1.0,
+                    "decision": "TEST",
+                    "is_labelled": True,
+                    "node_names": semantic_names,
+                    "semantic_score": 1.0,
+                    "geometric_score": 1.0,
+                }],
+                "status": "completed",
+            }
+            await db.searches.update_one({"id": record.id}, {"$set": update})
+
+            return SearchResponse(
+                id=record.id,
+                original_prompt=prompt,
+                attributes=attributes,
+                primary_model=primary,
+                all_models=[primary],
+                status="completed",
+                error_message=None,
+                created_at=record.created_at.isoformat(),
+            )
+        except Exception as e:
+            logger.error(f"[test] Test model pipeline failed: {e}", exc_info=True)
+            # Fall through to normal pipeline
+    # ─────────────────────────────────────────────────────────────────────────
+
     try:
         attributes = await refine_prompt_with_groq(prompt)
         models = await search_models_with_tavily(attributes)
@@ -987,10 +1101,23 @@ async def search_models(request: SearchRequest, http_request: Request):
                     
                     elif score_result.decision == "USE":
                         logger.info(f"  ✅ USE: Score {score_result.final_score:.4f} ≥ 0.5, well-defined labels")
-                        logger.info(f"     → Copying to output for Three.js rendering ...")
+                        logger.info(f"     → Renaming labels and copying to output ...")
 
-                        final_path = _copy_to_output(str(fetch_result.local_path))
-                        node_names = getattr(score_result, "node_names", []) or []
+                        rename_context = _build_rename_context(prompt=prompt, attributes=attributes, model=model)
+                        renamed_path, semantic_names = await rename_segmented_model(
+                            str(fetch_result.local_path),
+                            hint=", ".join(attributes.keywords) if attributes.keywords else prompt,
+                            context=rename_context,
+                        )
+
+                        if renamed_path:
+                            final_path = renamed_path
+                            node_names = semantic_names
+                            logger.info(f"     [rename] ✅ Labels renamed: {semantic_names}")
+                        else:
+                            logger.warning("     [rename] ⚠️  Renaming failed — copying original to output")
+                            final_path = _copy_to_output(str(fetch_result.local_path))
+                            node_names = getattr(score_result, "node_names", []) or []
 
                         model = ModelInfo(
                             **{**model.model_dump(),
