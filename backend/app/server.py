@@ -779,7 +779,7 @@ async def search_models_with_tavily(attributes: SearchAttributes) -> List[ModelI
             return tavily_client.search(
                 query=query,
                 search_depth="basic",
-                max_results=5,
+                max_results=25,
                 include_answer=False,
             )
         try:
@@ -1125,7 +1125,7 @@ async def _process_remaining_models_bg(
 ):
     """Background task: score remaining models and update DB record."""
     MAX_ATTEMPTS = 15
-    TARGET_SCORED = 5
+    TARGET_SCORED = 25
     scored_models = list(existing_scored)
     scored_count = len(scored_models)
     attempts = start_attempt
