@@ -1,7 +1,7 @@
 from fastapi import FastAPI, APIRouter, HTTPException, Query, UploadFile, File, Form, BackgroundTasks, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
+from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorGridFSBucket
 from pydantic import BaseModel, Field
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone, timedelta
@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 import httpx
 import tempfile
 import aiofiles
+from difflib import SequenceMatcher
 
 from app.blender_mcp import blender_client, conversation_store
 from app.mesh_renamer import rename_meshes_from_file
@@ -43,6 +44,7 @@ from app.conversation_service import (
     ChatRequest,
     ChatResponse,
     handle_model_chat,
+    _select_model_result,
 )
 
 ROOT_DIR = Path(__file__).parent.parent.parent.parent  # Sankalp/
@@ -54,6 +56,8 @@ logger = logging.getLogger(__name__)
 mongo_url = os.environ['MONGO_URL']
 db_client = AsyncIOMotorClient(mongo_url)
 db = db_client[os.environ['DB_NAME']]
+fs = AsyncIOMotorGridFSBucket(db)
+ENABLE_GRIDFS_CACHE = os.environ.get("ENABLE_GRIDFS_CACHE", "").strip().lower() in {"1", "true", "yes", "on"}
 
 groq_client = Groq(api_key=os.environ['GROQ_API_KEY'])
 tavily_client = TavilyClient(api_key=os.environ['TAVILY_API_KEY'])
@@ -75,22 +79,13 @@ class SegmentNarrationResponse(BaseModel):
     segments: List[Dict[str, str]]  # [{"name": "...", "description": "..."}]
 
 @api_router.get("/narration/{search_id}", response_model=SegmentNarrationResponse)
-async def get_segment_narration(search_id: str):
+async def get_segment_narration(search_id: str, model_url: str = Query(default="")):
     record = await db.searches.find_one({"id": search_id}, {"_id": 0})
     if not record:
         raise HTTPException(status_code=404, detail="Search not found")
 
-    # Match scored_result to primary model by URL
-    primary = record.get("primary_model") or {}
-    primary_url = primary.get("url") or primary.get("embed_url")
-
-    scored = record.get("scored_results", [])
-    primary_result = next(
-        (r for r in scored
-         if (r.get("model", {}).get("url") or r.get("model", {}).get("embed_url")) == primary_url),
-        scored[0] if scored else None,
-    )
-    node_names = primary_result.get("node_names", []) if primary_result else []
+    requested_model, selected_result = _select_model_result(record, (model_url or "").strip())
+    node_names = selected_result.get("node_names", []) if selected_result else []
 
     if not node_names:
         raise HTTPException(status_code=404, detail="No segments found")
@@ -121,6 +116,8 @@ async def get_segment_narration(search_id: str):
     prompt_context = record.get("original_prompt", "3D model")
     attributes = record.get("attributes") or {}
     object_type = attributes.get("object_type", "object")
+    model_title = requested_model.get("title") or "Unknown model"
+    model_description = requested_model.get("description") or ""
 
     # Ask LLM for one description per segment
     def _call():
@@ -131,6 +128,8 @@ async def get_segment_narration(search_id: str):
                 "content": (
                     f"You are an educational narrator for a 3D model viewer.\n"
                     f"The full model is: {prompt_context} (type: {object_type})\n"
+                    f"Model title: {model_title}\n"
+                    f"Model description: {model_description}\n"
                     f"For each segment name below, write a short spoken explanation suitable for narration.\n"
                     f"Adapt the explanation to the kind of model:\n"
                     f"- For living things, explain the part's role, structure, or biological function.\n"
@@ -568,6 +567,162 @@ def record_to_response(record: dict) -> SearchResponse:
         created_at=created_str,
     )
 
+
+def _normalize_search_text(value: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", (value or "").lower()))
+
+
+def _tokenize_search_text(value: str) -> set[str]:
+    return set(_normalize_search_text(value).split())
+
+
+def _jaccard_similarity(a: set[str], b: set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    union = a | b
+    if not union:
+        return 0.0
+    return len(a & b) / len(union)
+
+
+def _search_signature(prompt: str, attributes: Optional[SearchAttributes]) -> Dict[str, Any]:
+    attributes = attributes or SearchAttributes(
+        object_type="object",
+        style="realistic",
+        keywords=[],
+        refined_query=prompt,
+        confidence=1.0,
+    )
+    keywords = list(attributes.keywords or [])
+    combined = " ".join(
+        part for part in [
+            prompt,
+            attributes.object_type,
+            attributes.style,
+            attributes.refined_query,
+            " ".join(keywords),
+        ] if part
+    )
+    return {
+        "prompt_norm": _normalize_search_text(prompt),
+        "refined_norm": _normalize_search_text(attributes.refined_query),
+        "object_type_norm": _normalize_search_text(attributes.object_type),
+        "style_norm": _normalize_search_text(attributes.style),
+        "keywords_norm": [_normalize_search_text(k) for k in keywords if _normalize_search_text(k)],
+        "token_set": _tokenize_search_text(combined),
+    }
+
+
+def _record_attributes(record: dict) -> Optional[SearchAttributes]:
+    raw = record.get("attributes")
+    if not raw:
+        return None
+    try:
+        return SearchAttributes(**raw)
+    except Exception:
+        return None
+
+
+async def _cached_record_is_servable(record: dict) -> bool:
+    if not record:
+        return False
+
+    if record.get("status") == "no_model":
+        return True
+
+    primary = record.get("primary_model") or {}
+    model_url = str(primary.get("url") or primary.get("embed_url") or "").strip()
+    if not model_url:
+        return False
+
+    if model_url.startswith("/api/output/"):
+        filename = model_url.replace("/api/output/", "", 1)
+        if (OUTPUT_DIR / filename).exists():
+            return True
+        if ENABLE_GRIDFS_CACHE:
+            try:
+                cursor = fs.find({"filename": filename})
+                docs = await cursor.to_list(1)
+                if docs:
+                    return True
+            except Exception as exc:
+                logger.warning("[cache] GridFS lookup failed for %s: %s", filename, exc)
+        logger.warning("[cache] Skipping stale cached record; missing local model file: %s", filename)
+        return False
+
+    return True
+
+
+def _semantic_cache_score(
+    prompt: str,
+    attributes: SearchAttributes,
+    record: dict,
+) -> float:
+    candidate_prompt = str(record.get("original_prompt") or "")
+    candidate_attrs = _record_attributes(record)
+    candidate_sig = _search_signature(candidate_prompt, candidate_attrs)
+    query_sig = _search_signature(prompt, attributes)
+
+    exact_prompt = 1.0 if query_sig["prompt_norm"] and query_sig["prompt_norm"] == candidate_sig["prompt_norm"] else 0.0
+    exact_refined = 1.0 if query_sig["refined_norm"] and query_sig["refined_norm"] == candidate_sig["refined_norm"] else 0.0
+    object_match = 1.0 if query_sig["object_type_norm"] and query_sig["object_type_norm"] == candidate_sig["object_type_norm"] else 0.0
+    style_match = 1.0 if query_sig["style_norm"] and query_sig["style_norm"] == candidate_sig["style_norm"] else 0.0
+
+    keyword_overlap = _jaccard_similarity(set(query_sig["keywords_norm"]), set(candidate_sig["keywords_norm"]))
+    token_overlap = _jaccard_similarity(query_sig["token_set"], candidate_sig["token_set"])
+    refined_ratio = SequenceMatcher(None, query_sig["refined_norm"], candidate_sig["refined_norm"]).ratio() if query_sig["refined_norm"] and candidate_sig["refined_norm"] else 0.0
+    prompt_ratio = SequenceMatcher(None, query_sig["prompt_norm"], candidate_sig["prompt_norm"]).ratio() if query_sig["prompt_norm"] and candidate_sig["prompt_norm"] else 0.0
+
+    return (
+        0.30 * exact_prompt +
+        0.20 * exact_refined +
+        0.15 * object_match +
+        0.05 * style_match +
+        0.15 * keyword_overlap +
+        0.10 * token_overlap +
+        0.03 * refined_ratio +
+        0.02 * prompt_ratio
+    )
+
+
+async def _find_semantic_cached_search(prompt: str, attributes: SearchAttributes) -> Optional[dict]:
+    cursor = (
+        db.searches
+        .find(
+            {"status": {"$in": ["completed", "no_model"]}},
+            {"_id": 0},
+        )
+        .sort("created_at", -1)
+        .limit(200)
+    )
+    candidates = await cursor.to_list(length=200)
+    if not candidates:
+        return None
+
+    best_record = None
+    best_score = 0.0
+    for candidate in candidates:
+        score = _semantic_cache_score(prompt, attributes, candidate)
+        if score > best_score:
+            best_score = score
+            best_record = candidate
+
+    if not best_record:
+        return None
+
+    threshold = 0.72
+    if best_score >= threshold and await _cached_record_is_servable(best_record):
+        logger.info(
+            "[cache] Semantic cache hit for '%s' -> '%s' (score=%.3f)",
+            prompt,
+            best_record.get("original_prompt", ""),
+            best_score,
+        )
+        return best_record
+
+    logger.info("[cache] No semantic cache hit for '%s' (best score=%.3f)", prompt, best_score)
+    return None
+
 # ─── Services ─────────────────────────────────────────────────────────────────
 
 async def refine_prompt_with_groq(prompt: str) -> SearchAttributes:
@@ -802,35 +957,255 @@ async def _segment_and_rename_generated_model(
     logger.warning("[fallback] Renaming failed for generated mesh; using segmented output")
     return Path(segmented_path), []
 
+# ─── Model Evaluation Helper ──────────────────────────────────────────────────
+
+async def _evaluate_single_candidate(
+    model: ModelInfo,
+    idx: int,
+    total: int,
+    prompt: str,
+    attributes: "SearchAttributes",
+    sketchfab_api_key: str,
+) -> tuple:
+    """
+    Fetch, score, and post-process a single candidate model.
+    Returns (updated_model, scored_dict, summary_dict) on success,
+    or (None, None, None) on failure / PENDING.
+    """
+    model_url = model.url
+    if not model_url:
+        return None, None, None
+
+    try:
+        logger.info(f"[{idx}/{total}] Fetching {model_url}")
+        fetch_result = await fetch_model(url=model_url, sketchfab_api_key=sketchfab_api_key)
+        logger.info(
+            f"[{idx}/{total}] Fetch status: {fetch_result.status.value}, "
+            f"is_scorable: {fetch_result.is_scorable}, local_path: {fetch_result.local_path}"
+        )
+
+        if not (fetch_result.is_scorable and fetch_result.local_path):
+            logger.warning(f"[{idx}/{total}] ⚠️  Model NOT SCORABLE ({fetch_result.status.value})")
+            return None, None, None
+
+        metadata = fetch_result.metadata if fetch_result.metadata else {
+            "title": model.title,
+            "description": model.description or "",
+            "tags": model.tags,
+        }
+        logger.info(f"[{idx}/{total}] Scoring model...")
+        loop = asyncio.get_event_loop()
+        score_result = await loop.run_in_executor(
+            None, score_model, str(fetch_result.local_path), prompt, metadata
+        )
+
+        logger.info(f"\n{'='*70}")
+        logger.info(f"[{idx}/{total}] SCORING RESULT: {model.title[:50]}")
+        logger.info(f"{'='*70}")
+        logger.info(f"  Semantic Score:  {score_result.semantic.combined:.4f}")
+        logger.info(f"  Geometric Score: {score_result.geometric.combined:.4f}")
+        logger.info(f"  Final Score:     {score_result.final_score:.4f}")
+        logger.info(f"  Decision:        {score_result.decision}")
+        logger.info(f"-" * 70)
+
+        summary_dict = {
+            "title": model.title[:40],
+            "score": score_result.final_score,
+            "semantic": score_result.semantic.combined,
+            "geometric": score_result.geometric.combined,
+            "labelled": score_result.is_labelled,
+            "decision": score_result.decision,
+        }
+
+        scored_dict = None
+
+        if score_result.decision == "SEGMENT_MESH":
+            segmented_path = await segment_model(str(fetch_result.local_path))
+            if segmented_path:
+                rename_context = _build_rename_context(prompt=prompt, attributes=attributes, model=model)
+                renamed_path, semantic_names = await rename_segmented_model(
+                    segmented_path,
+                    hint=", ".join(attributes.keywords) if attributes.keywords else prompt,
+                    context=rename_context,
+                )
+                final_path = renamed_path if renamed_path else segmented_path
+                semantic_names = semantic_names if renamed_path else []
+                model = ModelInfo(
+                    **{**model.model_dump(),
+                       "url": f"/api/output/{Path(final_path).name}",
+                       "description": (model.description or "") + " [segmented + renamed]"}
+                )
+                scored_dict = {
+                    "model": model, "score": score_result.final_score,
+                    "decision": score_result.decision, "is_labelled": True,
+                    "node_names": semantic_names,
+                    "semantic_score": score_result.semantic.combined,
+                    "geometric_score": score_result.geometric.combined,
+                }
+
+        elif score_result.decision == "USE":
+            final_path = _copy_to_output(str(fetch_result.local_path))
+            node_names = getattr(score_result, "node_names", []) or []
+            model = ModelInfo(
+                **{**model.model_dump(), "type": "glb",
+                   "url": f"/api/output/{Path(final_path).name}",
+                   "description": (model.description or "") + " [used directly]"}
+            )
+            scored_dict = {
+                "model": model, "score": score_result.final_score,
+                "decision": score_result.decision,
+                "is_labelled": score_result.is_labelled,
+                "node_names": node_names,
+                "semantic_score": score_result.semantic.combined,
+                "geometric_score": score_result.geometric.combined,
+            }
+
+        elif score_result.decision == "RENAME":
+            rename_context = _build_rename_context(prompt=prompt, attributes=attributes, model=model)
+            renamed_path, semantic_names = await rename_segmented_model(
+                str(fetch_result.local_path),
+                hint=", ".join(attributes.keywords) if attributes.keywords else prompt,
+                context=rename_context,
+            )
+            if renamed_path:
+                final_path = renamed_path
+            else:
+                final_path = _copy_to_output(str(fetch_result.local_path))
+                semantic_names = getattr(score_result, "node_names", []) or []
+            model = ModelInfo(
+                **{**model.model_dump(), "type": "glb",
+                   "url": f"/api/output/{Path(final_path).name}",
+                   "description": (model.description or "") + " [labels refined]"}
+            )
+            scored_dict = {
+                "model": model, "score": score_result.final_score,
+                "decision": score_result.decision, "is_labelled": True,
+                "node_names": semantic_names,
+                "semantic_score": score_result.semantic.combined,
+                "geometric_score": score_result.geometric.combined,
+            }
+
+        # PENDING or unsupported decision → scored_dict stays None
+        return model, scored_dict, summary_dict
+
+    except Exception as e:
+        logger.error(f"[{idx}/{total}] ❌ EXCEPTION: {type(e).__name__}: {e}", exc_info=True)
+        return None, None, None
+
+
+async def _upload_to_gridfs(approved_models):
+    """Upload approved model GLBs to GridFS."""
+    if not ENABLE_GRIDFS_CACHE:
+        return
+    for item in approved_models:
+        model_url = item.url
+        if model_url and model_url.startswith("/api/output/"):
+            filename = model_url.replace("/api/output/", "")
+            local_path = OUTPUT_DIR / filename
+            if local_path.exists():
+                try:
+                    cursor = fs.find({"filename": filename})
+                    docs = await cursor.to_list(1)
+                    if not docs:
+                        with open(local_path, "rb") as file_data:
+                            await fs.upload_from_stream(filename, file_data)
+                            logger.info(f"Uploaded {filename} to GridFS")
+                except Exception as e:
+                    logger.error(f"Failed to upload {filename} to GridFS: {e}")
+
+
+async def _process_remaining_models_bg(
+    search_id: str,
+    remaining_models: list,
+    prompt: str,
+    attributes,
+    sketchfab_api_key: str,
+    start_attempt: int,
+    existing_scored: list,
+):
+    """Background task: score remaining models and update DB record."""
+    MAX_ATTEMPTS = 15
+    TARGET_SCORED = 5
+    scored_models = list(existing_scored)
+    scored_count = len(scored_models)
+    attempts = start_attempt
+
+    for model in remaining_models:
+        if scored_count >= TARGET_SCORED or attempts >= MAX_ATTEMPTS:
+            break
+        attempts += 1
+        _, scored_dict, _ = await _evaluate_single_candidate(
+            model, attempts, min(len(remaining_models) + start_attempt, MAX_ATTEMPTS),
+            prompt, attributes, sketchfab_api_key,
+        )
+        if scored_dict:
+            scored_models.append(scored_dict)
+            scored_count += 1
+
+    scored_models.sort(key=lambda x: x["score"], reverse=True)
+    approved = [item["model"] for item in scored_models]
+    primary = approved[0] if approved else None
+
+    await _upload_to_gridfs(approved)
+
+    update = {
+        "attributes": attributes.model_dump(),
+        "primary_model": primary.model_dump() if primary else None,
+        "all_models": [m.model_dump() for m in approved],
+        "scored_results": [
+            {
+                "model": item["model"].model_dump(),
+                "score": item["score"],
+                "decision": item["decision"],
+                "is_labelled": item["is_labelled"],
+                "node_names": item.get("node_names", []),
+                "semantic_score": item["semantic_score"],
+                "geometric_score": item["geometric_score"],
+            }
+            for item in scored_models
+        ],
+        "status": "completed",
+    }
+    await db.searches.update_one({"id": search_id}, {"$set": update})
+    logger.info(f"[BG] Finished processing remaining models for search {search_id}: {scored_count} total approved")
+
+
 # ─── Routes ───────────────────────────────────────────────────────────────────
 
 @api_router.post("/search", response_model=SearchResponse)
-async def search_models(request: SearchRequest, http_request: Request):
+async def search_models(request: SearchRequest, background_tasks: BackgroundTasks, http_request: Request):
     prompt = request.prompt.strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="Prompt cannot be empty")
 
-    # Cache check: same prompt within 24 hours
-    cache_cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+    attributes = await refine_prompt_with_groq(prompt)
+
+    # DB-first reuse: exact prompt/refined-query match first, then semantic reuse.
     cached = await db.searches.find_one(
         {
-            "original_prompt": {"$regex": f"^{re.escape(prompt)}$", "$options": "i"},
+            "$or": [
+                {"original_prompt": {"$regex": f"^{re.escape(prompt)}$", "$options": "i"}},
+                {"attributes.refined_query": attributes.refined_query},
+            ],
             "status": {"$in": ["completed", "no_model"]},
-            "created_at": {"$gte": cache_cutoff},
         },
         {"_id": 0},
+        sort=[("created_at", -1)],
     )
-    if cached:
-        logger.info(f"Cache hit: {prompt}")
+    if cached and await _cached_record_is_servable(cached):
+        logger.info("[cache] Exact cache hit: %s or %s", prompt, attributes.refined_query)
         return record_to_response(cached)
 
-    record = SearchRecord(original_prompt=prompt)
+    semantic_cached = await _find_semantic_cached_search(prompt, attributes)
+    if semantic_cached:
+        return record_to_response(semantic_cached)
+
+    record = SearchRecord(original_prompt=prompt, attributes=attributes)
     doc = record.model_dump()
     doc["created_at"] = doc["created_at"].isoformat()
     await db.searches.insert_one(doc)
 
     try:
-        attributes = await refine_prompt_with_groq(prompt)
         models = await search_models_with_tavily(attributes)
         
         if not models:
@@ -865,245 +1240,26 @@ async def search_models(request: SearchRequest, http_request: Request):
             logger.warning("⚠️  SKETCHFAB_API_KEY not set - downloadable models will be skipped!")
         
         scored_models = []
-        all_scoring_results = []  # Track all models for summary
-
-        # Keep fetching until 5 scorable models found or 15 attempts made
         MAX_ATTEMPTS  = 15
-        TARGET_SCORED = 5
         attempts      = 0
-        scored_count  = 0
 
+        # ─── FOREGROUND: Find the FIRST approved model and return immediately ───
         for model in models[:MAX_ATTEMPTS]:
-            if scored_count >= TARGET_SCORED:
-                break
             attempts += 1
-            i = attempts
+            _, scored_dict, _ = await _evaluate_single_candidate(
+                model, attempts, min(len(models), MAX_ATTEMPTS),
+                prompt, attributes, sketchfab_api_key,
+            )
+            if scored_dict:
+                scored_models.append(scored_dict)
+                break  # Got one → return it now, process rest in background
 
-            model_url = model.url
-            if not model_url:
-                continue
-                
-            try:
-                logger.info(f"[{i}/{min(len(models), 5)}] Fetching {model_url}")
-                
-                # Download model
-                fetch_result = await fetch_model(
-                    url=model_url,
-                    sketchfab_api_key=sketchfab_api_key
-                )
-                
-                logger.info(f"[{i}/{min(len(models), 5)}] Fetch status: {fetch_result.status.value}, is_scorable: {fetch_result.is_scorable}, local_path: {fetch_result.local_path}")
-                
-                # Only score if successfully fetched
-                if fetch_result.is_scorable and fetch_result.local_path:
-                    # fetch_result.metadata is already a dict with title, description, tags
-                    metadata = fetch_result.metadata if fetch_result.metadata else {
-                        "title": model.title,
-                        "description": model.description or "",
-                        "tags": model.tags,
-                    }
-                    
-                    logger.info(f"[{i}/{min(len(models), 5)}] Scoring model...")
-                    
-                    # Run scoring in thread pool
-                    loop = asyncio.get_event_loop()
-                    score_result = await loop.run_in_executor(
-                        None,
-                        score_model,
-                        str(fetch_result.local_path),
-                        prompt,
-                        metadata
-                    )
-                    
-                    # Log detailed scoring breakdown
-                    logger.info(f"\n{'='*70}")
-                    logger.info(f"[{i}/{min(len(models), 5)}] SCORING RESULT: {model.title[:50]}")
-                    logger.info(f"{'='*70}")
-                    logger.info(f"  Semantic Score:  {score_result.semantic.combined:.4f} (CLIP: {score_result.semantic.clip_score:.4f}, Metadata: {score_result.semantic.metadata_score:.4f})")
-                    logger.info(f"  Geometric Score: {score_result.geometric.combined:.4f}")
-                    logger.info(f"  Final Score:     {score_result.final_score:.4f} = {SEMANTIC_WEIGHT:.1f}×{score_result.semantic.combined:.4f} + {GEOMETRIC_WEIGHT:.1f}×{score_result.geometric.combined:.4f}")
-                    logger.info(f"  Is Labelled:     {score_result.is_labelled}")
-                    logger.info(f"  Decision:        {score_result.decision}")
-                    logger.info(f"-" * 70)
-                    
-                    # Store all results for summary
-                    all_scoring_results.append({
-                        "title": model.title[:40],
-                        "score": score_result.final_score,
-                        "semantic": score_result.semantic.combined,
-                        "geometric": score_result.geometric.combined,
-                        "labelled": score_result.is_labelled,
-                        "decision": score_result.decision,
-                    })
-                    
-                    # Apply decision gates - only USE and CACHE models are shown
-                    # New decision gate logic: SEGMENT_MESH / USE / RENAME / PENDING
-                    if score_result.decision == "SEGMENT_MESH":
-                        # Single mesh: segment it, apply semantic naming, ready to use
-                        logger.info(f"  ✅ SEGMENT_MESH: Score {score_result.final_score:.4f} ≥ 0.5, single node")
-                        logger.info(f"     → Segmenting mesh and creating semantic names...")
-                        
-                        segmented_path = await segment_model(str(fetch_result.local_path))
-                        if segmented_path:
-                            logger.info(f"     [segment] ✅ Done: {segmented_path}")
-                            
-                            # Rename segments to semantic names using original prompt as hint
-                            logger.info("     [rename] Applying semantic naming to segments ...")
-                            rename_context = _build_rename_context(prompt=prompt, attributes=attributes, model=model)
-                            renamed_path, semantic_names = await rename_segmented_model(
-                                segmented_path, 
-                                hint=", ".join(attributes.keywords) if attributes.keywords else prompt,
-                                context=rename_context,
-                            )
-                            if renamed_path:
-                                logger.info(f"     [rename] ✅ Segments renamed: {semantic_names}")
-                                final_path = renamed_path
-                                # Update node_names with semantic names for conversation service
-
-                            else:
-                                logger.warning("     [rename] ⚠️  Renaming failed, using original segments")
-                                final_path = segmented_path
-                                semantic_names = []
-                            
-                            model = ModelInfo(
-                                **{**model.model_dump(),
-                                   "url": f"/api/output/{Path(final_path).name}",
-                                   "description": (model.description or "") + " [segmented + renamed]"}
-                            )
-                            
-                            scored_models.append({
-                                "model": model,
-                                "score": score_result.final_score,
-                                "decision": score_result.decision,
-                                "is_labelled": True,  # Now has semantic node names
-                                "node_names": semantic_names,
-                                "semantic_score": score_result.semantic.combined,
-                                "geometric_score": score_result.geometric.combined,
-                            })
-                            scored_count += 1
-                            logger.info(f"  📦 Node names ({len(semantic_names)}): {semantic_names}")
-                        else:
-                            logger.warning("     [segment] ⚠️  Failed — skipping this model")
-                    
-                    elif score_result.decision == "USE":
-                        logger.info(f"  ✅ USE: Score {score_result.final_score:.4f} ≥ 0.5, well-defined labels")
-                        logger.info(f"     → Copying to output for Three.js rendering ...")
-
-                        final_path = _copy_to_output(str(fetch_result.local_path))
-                        node_names = getattr(score_result, "node_names", []) or []
-
-                        model = ModelInfo(
-                            **{**model.model_dump(),
-                               "type": "glb",
-                               "url": f"/api/output/{Path(final_path).name}",
-                               "description": (model.description or "") + " [used directly]"}
-                        )
-                        scored_models.append({
-                            "model": model,
-                            "score": score_result.final_score,
-                            "decision": score_result.decision,
-                            "is_labelled": score_result.is_labelled,
-                            "node_names": node_names,
-                            "semantic_score": score_result.semantic.combined,
-                            "geometric_score": score_result.geometric.combined,
-                        })
-                        scored_count += 1
-                        logger.info(f"  📦 Node names ({len(node_names)}): {node_names}")
-                    
-                    elif score_result.decision == "RENAME":
-                        # Multiple nodes with poorly-defined labels: fix with renamer
-                        logger.info(f"  ⚠️  RENAME: Score {score_result.final_score:.4f} ≥ 0.5, poorly-defined labels")
-                        logger.info(f"     → Labels need semantic refinement via mesh_renamer...")
-                        
-                        # Call renamer to fix the labels
-                        logger.info("     [rename] Refining node labels with semantic naming...")
-                        rename_context = _build_rename_context(prompt=prompt, attributes=attributes, model=model)
-                        renamed_path, semantic_names = await rename_segmented_model(
-                            str(fetch_result.local_path),
-                            hint=", ".join(attributes.keywords) if attributes.keywords else prompt,
-                            context=rename_context,
-                        )
-                        
-                        if renamed_path:
-                            logger.info(f"     [rename] ✅ Labels refined: {semantic_names}")
-                            final_path = renamed_path
-                        else:
-                            logger.warning("     [rename] ⚠️  Renaming failed — copying original to output")
-                            final_path = _copy_to_output(str(fetch_result.local_path))
-                            semantic_names = getattr(score_result, "node_names", []) or []
-
-                        model = ModelInfo(
-                            **{**model.model_dump(),
-                               "type": "glb",
-                               "url": f"/api/output/{Path(final_path).name}",
-                               "description": (model.description or "") + " [labels refined]"}
-                        )
-                        
-                        scored_models.append({
-                            "model": model,
-                            "score": score_result.final_score,
-                            "decision": score_result.decision,
-                            "is_labelled": True,  # Now has refined labels
-                            "node_names": semantic_names,
-                            "semantic_score": score_result.semantic.combined,
-                            "geometric_score": score_result.geometric.combined,
-                        })
-                        scored_count += 1
-                        logger.info(f"  📦 Node names ({len(semantic_names)}): {semantic_names}")
-                    
-                    elif score_result.decision == "PENDING":
-                        # Score < 0.5: awaiting user definition
-                        logger.info(f"  ⏸️  PENDING: Score {score_result.final_score:.4f} < 0.5")
-                        logger.info(f"     → Score below threshold. Skipping for now (awaiting threshold definition).")
-                    
-                    logger.info(f"{'='*70}\n")
-                
-                else:
-                    # Model fetched but not scorable
-                    logger.warning(f"[{i}/{min(len(models), 5)}] ⚠️  Model NOT SCORABLE")
-                    logger.warning(f"     Status: {fetch_result.status.value}")
-                    logger.warning(f"     Reason: is_scorable={fetch_result.is_scorable}, has_local_path={bool(fetch_result.local_path)}")
-                    if fetch_result.status.value == "NOT_DOWNLOADABLE":
-                        logger.warning(f"     → Model is view-only (Sketchfab embed without download permission)")
-                    elif fetch_result.status.value == "DOWNLOAD_FAILED":
-                        logger.warning(f"     → Download failed - model may require authentication or be deleted")
-                    
-            except Exception as e:
-                logger.error(f"[{i}/{min(len(models), 5)}] ❌ EXCEPTION during fetch/score: {type(e).__name__}: {e}", exc_info=True)
-                continue
-        
-        # Sort by score (highest first)
-        scored_models.sort(key=lambda x: x["score"], reverse=True)
-        
-        # Extract approved models
         approved_models = [item["model"] for item in scored_models]
         primary = approved_models[0] if approved_models else None
-        
-        # ─── SCORING SUMMARY TABLE ───
-        logger.info(f"\n{'='*90}")
-        logger.info(f"  SCORING SUMMARY - {len(all_scoring_results)} MODELS EVALUATED")
-        logger.info(f"{'='*90}")
-        logger.info(f"  {'Model':<40} {'Final':<8} {'Sem':<7} {'Geo':<7} {'Labelled':<10} {'Decision':<10}")
-        logger.info(f"  {'-'*40} {'-'*8} {'-'*7} {'-'*7} {'-'*10} {'-'*10}")
-        
-        for result in all_scoring_results:
-            decision_symbol = "✅" if result["decision"] in ["USE", "SEGMENT_MESH", "RENAME"] else "❌"
-            labelled_str = "Yes" if result["labelled"] else "No"
-            logger.info(
-                f"  {result['title']:<40} {result['score']:.4f}   "
-                f"{result['semantic']:.4f}  {result['geometric']:.4f}  "
-                f"{labelled_str:<10} {decision_symbol} {result['decision']:<10}"
-            )
-        
-        logger.info(f"{'='*90}")
-        logger.info(f"  THRESHOLDS: Labelled models need >{THRESHOLD_LABELLED:.2f} | Unlabelled models need >{THRESHOLD_UNLABELLED:.2f}")
-        logger.info(f"  RESULT: {len(scored_models)} APPROVED / {len(all_scoring_results)} EVALUATED / {attempts} ATTEMPTED")
-        logger.info(f"{'='*90}\n")
-        
-        # ─── FALLBACK STRATEGY: Generate model if none approved (includes score < 0.5) ───
+
+        # ─── FALLBACK: Generate model if none approved ───
         if not approved_models:
             logger.warning("⚠️  No approved model available. Triggering mesh-generation fallback.")
-
             try:
                 generated_path, image_url, image_bytes, generator_endpoint = await _generate_mesh_file_from_prompt(prompt)
                 logger.info(f"[fallback] Generated base mesh: {generated_path}")
@@ -1122,15 +1278,12 @@ async def search_models(request: SearchRequest, http_request: Request):
                     ),
                 )
                 final_path, semantic_names = await _segment_and_rename_generated_model(
-                    generated_path,
-                    hint=rename_hint,
-                    context=rename_context,
+                    generated_path, hint=rename_hint, context=rename_context,
                 )
 
                 output_url = str(http_request.url_for("serve_output_file", filename=final_path.name))
                 primary = ModelInfo(
-                    type="glb",
-                    url=output_url,
+                    type="glb", url=output_url,
                     title=f"Generated: {prompt}",
                     source_url=generator_endpoint,
                     source_domain="mesh-generator",
@@ -1140,19 +1293,14 @@ async def search_models(request: SearchRequest, http_request: Request):
                     ),
                     tags=attributes.keywords,
                 )
-
                 approved_models = [primary]
-                scored_models.append(
-                    {
-                        "model": primary,
-                        "score": 0.0,
-                        "decision": "GENERATED_FALLBACK",
-                        "is_labelled": bool(semantic_names),
-                        "node_names": semantic_names,
-                        "semantic_score": 0.0,
-                        "geometric_score": 0.0,
-                    }
-                )
+                scored_models.append({
+                    "model": primary, "score": 0.0,
+                    "decision": "GENERATED_FALLBACK",
+                    "is_labelled": bool(semantic_names),
+                    "node_names": semantic_names,
+                    "semantic_score": 0.0, "geometric_score": 0.0,
+                })
                 status = "completed"
             except Exception as e:
                 logger.error(f"❌ Mesh-generation fallback failed: {e}", exc_info=True)
@@ -1160,13 +1308,17 @@ async def search_models(request: SearchRequest, http_request: Request):
         else:
             status = "completed"
 
+        # Upload first model to GridFS
+        await _upload_to_gridfs(approved_models)
+
+        # Save first-model result to DB immediately
         update = {
             "attributes": attributes.model_dump(),
             "primary_model": primary.model_dump() if primary else None,
             "all_models": [m.model_dump() for m in approved_models],
             "scored_results": [
                 {
-                    "model": item["model"].model_dump(),  # Convert ModelInfo to dict
+                    "model": item["model"].model_dump(),
                     "score": item["score"],
                     "decision": item["decision"],
                     "is_labelled": item["is_labelled"],
@@ -1179,6 +1331,21 @@ async def search_models(request: SearchRequest, http_request: Request):
             "status": status,
         }
         await db.searches.update_one({"id": record.id}, {"$set": update})
+
+        # ─── BACKGROUND: Schedule remaining models for async processing ───
+        remaining = models[attempts:MAX_ATTEMPTS]
+        if remaining and status == "completed":
+            logger.info(f"[BG] Scheduling {len(remaining)} remaining models for background processing")
+            background_tasks.add_task(
+                _process_remaining_models_bg,
+                record.id,
+                remaining,
+                prompt,
+                attributes,
+                sketchfab_api_key,
+                attempts,
+                scored_models,
+            )
 
         return SearchResponse(
             id=record.id,
@@ -1264,7 +1431,21 @@ async def download_model(url: str, background_tasks: BackgroundTasks):
 
 @api_router.get("/output/{filename}")
 async def serve_output_file(filename: str):
-    """Serve segmented GLB files from app/output/ over HTTP."""
+    """Serve segmented GLB files from GridFS or local app/output/ over HTTP."""
+    # Try GridFS first
+    try:
+        grid_out = await fs.open_download_stream_by_name(filename)
+        file_data = await grid_out.read()
+        
+        return StreamingResponse(
+            iter([file_data]),
+            media_type="model/gltf-binary",
+            headers={"Content-Length": str(len(file_data))}
+        )
+    except Exception as e:
+        logger.warning(f"GridFS not found for {filename}, falling back to local: {e}")
+
+    # Fallback to local file
     file_path = OUTPUT_DIR / filename
     if not file_path.exists():
         raise HTTPException(status_code=404, detail=f"File not found: {filename}")

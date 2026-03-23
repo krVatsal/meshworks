@@ -218,6 +218,7 @@ function GltfViewer({ src, highlightLabel, animating, onAnimationEnd }: {
   const outlineLayerRef = useRef<THREE.Scene | null>(null);
   const materialDefaultsRef = useRef<Map<string, any>>(new Map());
   const meshesRef = useRef<THREE.Mesh[]>([]);
+  const [meshLoadVersion, setMeshLoadVersion] = useState(0);
   const highlightLabelRef = useRef<string | null>(highlightLabel);
   const animatingRef = useRef(animating);
   useEffect(() => { animatingRef.current = animating; }, [animating]);
@@ -342,6 +343,7 @@ function GltfViewer({ src, highlightLabel, animating, onAnimationEnd }: {
     if (!mountRef.current) return;
 
     const container = mountRef.current;
+    setMeshLoadVersion(0);
     const width = container.clientWidth;
     const height = container.clientHeight;
 
@@ -481,6 +483,7 @@ function GltfViewer({ src, highlightLabel, animating, onAnimationEnd }: {
               }
             });
             meshesRef.current = meshes;
+            setMeshLoadVersion((version) => version + 1);
             applyHighlight(highlightLabelRef.current);
           },
           undefined,
@@ -560,12 +563,8 @@ function GltfViewer({ src, highlightLabel, animating, onAnimationEnd }: {
         if (cancelled) break;
 
         const mesh = bestMeshMatch(meshesRef.current, seg.name);
-        if (!mesh) continue;
+        applyHighlight(mesh ? seg.name : null);
 
-        // Just highlight — no movement
-        applyHighlight(seg.name);
-
-        // Narrate
         await new Promise<void>(resolve => {
           if (!window.speechSynthesis) { resolve(); return; }
           window.speechSynthesis.cancel();
@@ -591,7 +590,7 @@ function GltfViewer({ src, highlightLabel, animating, onAnimationEnd }: {
       cancelled = true;
       window.speechSynthesis?.cancel();
     };
-  }, [animating]);
+  }, [animating, meshLoadVersion]);
 
   return (
     <div

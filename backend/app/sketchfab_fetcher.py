@@ -36,8 +36,8 @@ import httpx
 # ─────────────────────────────────────────────
 
 SKETCHFAB_API_BASE   = "https://api.sketchfab.com/v3"
-DOWNLOAD_TIMEOUT_SEC = 120       # max seconds to wait for a model download
-MAX_FILE_SIZE_MB     = 150       # skip models larger than this
+DOWNLOAD_TIMEOUT_SEC = httpx.Timeout(connect=10, read=120, write=30, pool=10)
+MAX_FILE_SIZE_MB     = 50        # skip models larger than this
 TEMP_DIR             = Path(tempfile.gettempdir()) / "prompt2mesh_models"
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 

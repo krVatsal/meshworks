@@ -97,7 +97,10 @@ export default function ViewerPage() {
     if (!data?.id) return;
     setLoadingStory(true);
     try {
-      const res = await axios.get(`${API}/narration/${data.id}`);
+      const selectedModelUrl = activeModel?.url ?? activeModel?.embed_url ?? "";
+      const res = await axios.get(`${API}/narration/${data.id}`, {
+        params: selectedModelUrl ? { model_url: selectedModelUrl } : {},
+      });
       setAnimating({ segments: res.data.segments });
     } catch {
       console.error("Failed to load narration");

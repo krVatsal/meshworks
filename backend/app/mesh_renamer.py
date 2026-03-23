@@ -658,6 +658,60 @@ def _replace_low_confidence_with_heuristics(
     return out
 
 
+def _count_category_term_hits(names: Dict[str, str], terms: List[str]) -> int:
+    if not names or not terms:
+        return 0
+
+    total = 0
+    term_set = set(terms)
+    for raw_name in names.values():
+        normalized = _normalize_name(raw_name, "")
+        if not normalized:
+            continue
+        tokens = normalized.split("_")
+        if any(token in term_set for token in tokens):
+            total += 1
+    return total
+
+
+def _needs_category_override(
+    names: Dict[str, str],
+    expected_category: str,
+) -> bool:
+    if not names or not expected_category:
+        return False
+
+    category_terms = {
+        "animal": [
+            "head", "snout", "ear", "tail", "front", "hind", "leg",
+            "back", "chest", "belly", "torso", "hindquarters",
+        ],
+        "humanoid": [
+            "head", "arm", "leg", "torso", "upper", "pelvis",
+            "hand", "foot", "shoulder", "neck",
+        ],
+        "vehicle": [
+            "wheel", "tire", "roof", "hood", "body", "bumper",
+            "trunk", "window", "windshield", "door", "fender",
+            "chassis", "grille", "mirror",
+        ],
+    }
+
+    expected_hits = _count_category_term_hits(names, category_terms.get(expected_category, []))
+    strongest_other_hits = 0
+    for category, terms in category_terms.items():
+        if category == expected_category:
+            continue
+        strongest_other_hits = max(strongest_other_hits, _count_category_term_hits(names, terms))
+
+    total = len(names)
+    if total == 0:
+        return False
+
+    mismatch_threshold = max(3, math.ceil(total * 0.25))
+    return expected_hits == 0 and strongest_other_hits >= mismatch_threshold
+
+
 def _disambiguate_duplicate_names(
     name_map: Dict[str, str],
     mesh_infos: List[Dict[str, Any]],
@@ -953,6 +1007,16 @@ async def rename_meshes(
                 "using ordered object-part labels instead."
             )
             normalized = _replace_low_confidence_names(normalized, mesh_infos, hint, normalized_context)
+
+    inferred_category = _infer_semantic_category(hint, normalized_context)
+    if _needs_category_override(normalized, inferred_category):
+        heuristic_names = _replace_low_confidence_with_heuristics(mesh_infos, hint, normalized_context)
+        if heuristic_names:
+            logs.append(
+                f"Generated names conflicted with inferred '{inferred_category}' context; "
+                "overriding with category-aware heuristics."
+            )
+            normalized = heuristic_names
 
     merged = _apply_merged_names(normalized, merge_groups)
     merged = _disambiguate_duplicate_names(merged, mesh_infos, merge_groups)
