@@ -14,7 +14,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "MeshVault | 3D Model Discovery",
+  title: "MeshWork | 3D Model Discovery",
   description: "Discover 3D models with natural language",
 };
 

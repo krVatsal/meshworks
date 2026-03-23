@@ -34,7 +34,7 @@ export default function NavBar() {
               />
             </div>
             <span className="font-rajdhani font-bold text-lg tracking-widest text-white">
-              MESHVAULT
+              MESHWORK
             </span>
             <span className="hidden sm:block text-[10px] font-mono text-cyber/60 tracking-widest pt-0.5">
               v1.0

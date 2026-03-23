@@ -628,7 +628,11 @@ async def _cached_record_is_servable(record: dict) -> bool:
         return False
 
     if record.get("status") == "no_model":
-        return True
+        logger.info(
+            "[cache] Skipping cached no_model record for prompt retry: %s",
+            record.get("original_prompt", ""),
+        )
+        return False
 
     primary = record.get("primary_model") or {}
     model_url = str(primary.get("url") or primary.get("embed_url") or "").strip()
