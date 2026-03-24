@@ -1414,24 +1414,62 @@ async def root():
     return {"message": "3D Model Discovery API", "version": "1.0"}
 
 @api_router.get("/download")
-async def download_model(url: str, background_tasks: BackgroundTasks):
-    from app.sketchfab_fetcher import fetch_model
-    from dotenv import load_dotenv
-    load_dotenv(ROOT_DIR / '.env', override=True)
-    sketchfab_api_key = os.environ.get('SKETCHFAB_API_KEY', '')
-    
-    result = await fetch_model(url, sketchfab_api_key)
-    
-    if not result.local_path or not os.path.exists(result.local_path):
-        raise HTTPException(status_code=400, detail=f"Could not download model: {result.error}")
-        
-    filename = os.path.basename(result.local_path)
-    
-    return FileResponse(
-        path=result.local_path, 
-        filename=filename, 
-        media_type='application/octet-stream'
+async def download_model(url: str):
+    """Always serve the locally processed model from output/."""
+
+    # Case 1: already a local output URL
+    if url.startswith("/api/output/"):
+        filename = url.replace("/api/output/", "", 1)
+        file_path = OUTPUT_DIR / filename
+        if file_path.exists():
+            return FileResponse(
+                path=str(file_path),
+                filename=filename,
+                media_type="application/octet-stream",
+                headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+            )
+        raise HTTPException(status_code=404, detail=f"Processed file not found: {filename}")
+
+    # Case 2: external URL — check if we already have a processed version in output/
+    # Match by URL hash (same hash used by sketchfab_fetcher for caching)
+    import hashlib
+    url_hash = hashlib.md5(url.encode()).hexdigest()[:10]
+    # Look for any file in output/ whose name contains this hash
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    matches = list(OUTPUT_DIR.glob(f"*{url_hash}*"))
+    if matches:
+        file_path = matches[0]
+        return FileResponse(
+            path=str(file_path),
+            filename=file_path.name,
+            media_type="application/octet-stream",
+            headers={"Content-Disposition": f'attachment; filename="{file_path.name}"'}
+        )
+
+    # Case 3: no processed version found — look up in DB by source URL
+    record = await db.searches.find_one(
+        {"$or": [
+            {"primary_model.url": url},
+            {"primary_model.source_url": url},
+            {"all_models": {"$elemMatch": {"source_url": url}}},
+        ]},
+        {"_id": 0, "primary_model": 1}
     )
+    if record:
+        primary = record.get("primary_model") or {}
+        model_url = primary.get("url", "")
+        if model_url.startswith("/api/output/"):
+            filename = model_url.replace("/api/output/", "", 1)
+            file_path = OUTPUT_DIR / filename
+            if file_path.exists():
+                return FileResponse(
+                    path=str(file_path),
+                    filename=filename,
+                    media_type="application/octet-stream",
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+                )
+
+    raise HTTPException(status_code=404, detail="No processed model found for this URL")
 
 @api_router.get("/output/{filename}")
 async def serve_output_file(filename: str):
@@ -1458,6 +1496,130 @@ async def serve_output_file(filename: str):
         filename=filename,
         media_type="model/gltf-binary"
     )
+
+#image search 
+
+@api_router.post("/search/image", response_model=SearchResponse)
+async def search_from_image(
+    file: UploadFile = File(...),
+    http_request: Request = None,
+):
+    """
+    Accept an uploaded image, send it directly to the mesh generation API,
+    then segment + rename the result. Skips search and scoring entirely.
+    """
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Only image files are supported")
+
+    image_bytes = await file.read()
+    if len(image_bytes) < 1000:
+        raise HTTPException(status_code=400, detail="Image file too small")
+
+    # Use filename as prompt context
+    prompt = file.filename.rsplit(".", 1)[0].replace("_", " ").replace("-", " ") or "3d model from image"
+
+    record = SearchRecord(original_prompt=f"[image] {prompt}")
+    doc = record.model_dump()
+    doc["created_at"] = doc["created_at"].isoformat()
+    await db.searches.insert_one(doc)
+
+    try:
+        attributes = await refine_prompt_with_groq(prompt)
+
+        # Send image directly to mesh generation API
+        mesh_api_url = os.environ.get("MESH_GENERATOR_URL", "http://98.70.40.74:8000/generate-mesh")
+        async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+            try:
+                response = await client.post(
+                    mesh_api_url,
+                    files={"file": (file.filename, image_bytes, file.content_type)},
+                )
+            except Exception as exc:
+                raise HTTPException(status_code=502, detail="Mesh generation API is unreachable") from exc
+
+        if response.status_code != 200:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Mesh generation API failed: {response.text[:300]}"
+            )
+
+        # Save generated GLB
+        output_filename = f"img_{uuid.uuid4().hex}.glb"
+        output_path = OUTPUT_DIR / output_filename
+        OUTPUT_DIR.mkdir(exist_ok=True)
+        async with aiofiles.open(output_path, "wb") as f:
+            await f.write(response.content)
+
+        logger.info(f"[image-search] Generated mesh: {output_path}")
+
+        # Segment + rename
+        rename_context = _build_rename_context(
+            prompt=prompt,
+            attributes=attributes,
+            model=ModelInfo(
+                type="glb",
+                title=f"Generated from image: {file.filename}",
+                source_url="",
+                source_domain="image-upload",
+                description=f"Generated from uploaded image: {file.filename}",
+                tags=attributes.keywords,
+            ),
+        )
+        final_path, semantic_names = await _segment_and_rename_generated_model(
+            output_path,
+            hint=f"{prompt}. Parts to identify: {', '.join(attributes.keywords)}. Object type: {attributes.object_type}",
+            context=rename_context,
+        )
+
+        output_url = f"/api/output/{final_path.name}"
+        primary = ModelInfo(
+            type="glb",
+            url=output_url,
+            title=f"Generated from image: {file.filename}",
+            source_url=mesh_api_url,
+            source_domain="image-upload",
+            description=f"Generated via TripoSR from uploaded image, then segmented/renamed",
+            tags=attributes.keywords,
+        )
+
+        update = {
+            "attributes": attributes.model_dump(),
+            "primary_model": primary.model_dump(),
+            "all_models": [primary.model_dump()],
+            "scored_results": [{
+                "model": primary.model_dump(),
+                "score": 1.0,
+                "decision": "IMAGE_GENERATED",
+                "is_labelled": bool(semantic_names),
+                "node_names": semantic_names,
+                "semantic_score": 1.0,
+                "geometric_score": 1.0,
+            }],
+            "status": "completed",
+        }
+        await db.searches.update_one({"id": record.id}, {"$set": update})
+
+        return SearchResponse(
+            id=record.id,
+            original_prompt=f"[image] {prompt}",
+            attributes=attributes,
+            primary_model=primary,
+            all_models=[primary],
+            status="completed",
+            error_message=None,
+            created_at=record.created_at.isoformat(),
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Image search error: {e}", exc_info=True)
+        await db.searches.update_one(
+            {"id": record.id},
+            {"$set": {"status": "failed", "error_message": str(e)}},
+        )
+        raise HTTPException(status_code=500, detail=f"Image search failed: {str(e)}")
+    
 
 @api_router.post("/mesh/rename")
 async def mesh_rename(

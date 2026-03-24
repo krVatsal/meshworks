@@ -11,6 +11,7 @@ import {
   Zap,
   Box,
   Layers,
+  Image as ImageIcon,
 } from "lucide-react";
 
 const API = `${process.env.NEXT_PUBLIC_BACKEND_URL}/api`;
@@ -52,6 +53,9 @@ export default function SearchPage() {
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const router = useRouter();
   const inputRef = useRef<HTMLInputElement>(null);
+  const [imageFile, setImageFile] = useState<File | null>(null);
+  const [imagePreview, setImagePreview] = useState<string | null>(null);
+  const imageInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -80,6 +84,7 @@ export default function SearchPage() {
 
   const handleSearch = async (e?: React.FormEvent) => {
     e?.preventDefault();
+    if (imageFile) { handleImageSearch(); return; }
     const q = prompt.trim();
     if (!q || loading) return;
 
@@ -103,6 +108,35 @@ export default function SearchPage() {
   const handleExample = (ex: string) => {
     setPrompt(ex);
     inputRef.current?.focus();
+  };
+
+  const handleImageSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setImageFile(file);
+    setImagePreview(URL.createObjectURL(file));
+    setPrompt("");
+  };
+
+  const handleImageSearch = async () => {
+    if (!imageFile || loading) return;
+    setLoading(true);
+    setLoadingStep(0);
+    setError(null);
+    const formData = new FormData();
+    formData.append("file", imageFile);
+    try {
+      const res = await axios.post(`${API}/search/image`, formData, {
+        headers: { "Content-Type": "multipart/form-data" },
+      });
+      router.push(`/view/${res.data.id}`);
+    } catch (err: unknown) {
+      const msg = axios.isAxiosError(err)
+        ? err.response?.data?.detail || "Image search failed."
+        : "Image search failed.";
+      setError(msg);
+      setLoading(false);
+    }
   };
 
   return (
@@ -157,9 +191,44 @@ export default function SearchPage() {
                     ×
                   </button>
                 )}
+
+                {/* Image upload */}
+                <input
+                  ref={imageInputRef}
+                  type="file"
+                  accept="image/*"
+                  onChange={handleImageSelect}
+                  className="hidden"
+                />
+                {imagePreview ? (
+                  <div className="flex items-center gap-2 flex-shrink-0">
+                    <img
+                      src={imagePreview}
+                      alt="preview"
+                      className="w-7 h-7 object-cover border border-cyber/40"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => { setImageFile(null); setImagePreview(null); }}
+                      className="text-slate-600 hover:text-neon-red transition-colors text-lg leading-none"
+                    >
+                      ×
+                    </button>
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => imageInputRef.current?.click()}
+                    disabled={loading}
+                    title="Search from image"
+                    className="flex-shrink-0 text-slate-500 hover:text-cyber transition-colors duration-200 disabled:opacity-30"
+                  >
+                    <ImageIcon size={16} />
+                  </button>
+                )}
                 <button
                   type="submit"
-                  disabled={!prompt.trim() || loading}
+                  disabled={(!prompt.trim() && !imageFile) || loading}
                   data-testid="search-btn"
                   className="flex items-center gap-2 px-5 py-2 bg-cyber/10 border border-cyber/50 text-cyber font-rajdhani font-bold text-sm tracking-widest hover:bg-cyber/20 hover:border-cyber transition-colors duration-200 disabled:opacity-30 disabled:cursor-not-allowed"
                 >
