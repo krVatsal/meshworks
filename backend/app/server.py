@@ -568,6 +568,33 @@ def record_to_response(record: dict) -> SearchResponse:
     )
 
 
+def _build_search_update(
+    attributes: SearchAttributes,
+    scored_models: List[Dict[str, Any]],
+    status: str,
+) -> Dict[str, Any]:
+    approved_models = [item["model"] for item in scored_models]
+    primary_model = approved_models[0] if approved_models else None
+    return {
+        "attributes": attributes.model_dump(),
+        "primary_model": primary_model.model_dump() if primary_model else None,
+        "all_models": [m.model_dump() for m in approved_models],
+        "scored_results": [
+            {
+                "model": item["model"].model_dump(),
+                "score": item["score"],
+                "decision": item["decision"],
+                "is_labelled": item["is_labelled"],
+                "node_names": item.get("node_names", []),
+                "semantic_score": item["semantic_score"],
+                "geometric_score": item["geometric_score"],
+            }
+            for item in scored_models
+        ],
+        "status": status,
+    }
+
+
 def _normalize_search_text(value: str) -> str:
     return " ".join(re.findall(r"[a-z0-9]+", (value or "").lower()))
 
@@ -1144,33 +1171,24 @@ async def _process_remaining_models_bg(
         )
         if scored_dict:
             scored_models.append(scored_dict)
+            scored_models.sort(key=lambda x: x["score"], reverse=True)
             scored_count += 1
+            await _upload_to_gridfs([scored_dict["model"]])
+            await db.searches.update_one(
+                {"id": search_id},
+                {"$set": _build_search_update(attributes, scored_models, "processing")},
+            )
+            logger.info(
+                "[BG] Search %s accepted another approved model; %s approved so far",
+                search_id,
+                scored_count,
+            )
 
     scored_models.sort(key=lambda x: x["score"], reverse=True)
-    approved = [item["model"] for item in scored_models]
-    primary = approved[0] if approved else None
-
-    await _upload_to_gridfs(approved)
-
-    update = {
-        "attributes": attributes.model_dump(),
-        "primary_model": primary.model_dump() if primary else None,
-        "all_models": [m.model_dump() for m in approved],
-        "scored_results": [
-            {
-                "model": item["model"].model_dump(),
-                "score": item["score"],
-                "decision": item["decision"],
-                "is_labelled": item["is_labelled"],
-                "node_names": item.get("node_names", []),
-                "semantic_score": item["semantic_score"],
-                "geometric_score": item["geometric_score"],
-            }
-            for item in scored_models
-        ],
-        "status": "completed",
-    }
-    await db.searches.update_one({"id": search_id}, {"$set": update})
+    await db.searches.update_one(
+        {"id": search_id},
+        {"$set": _build_search_update(attributes, scored_models, "completed")},
+    )
     logger.info(f"[BG] Finished processing remaining models for search {search_id}: {scored_count} total approved")
 
 
@@ -1314,30 +1332,14 @@ async def search_models(request: SearchRequest, background_tasks: BackgroundTask
 
         # Upload first model to GridFS
         await _upload_to_gridfs(approved_models)
+        remaining = models[attempts:MAX_ATTEMPTS]
+        response_status = "processing" if remaining and status == "completed" else status
 
         # Save first-model result to DB immediately
-        update = {
-            "attributes": attributes.model_dump(),
-            "primary_model": primary.model_dump() if primary else None,
-            "all_models": [m.model_dump() for m in approved_models],
-            "scored_results": [
-                {
-                    "model": item["model"].model_dump(),
-                    "score": item["score"],
-                    "decision": item["decision"],
-                    "is_labelled": item["is_labelled"],
-                    "node_names": item.get("node_names", []),
-                    "semantic_score": item["semantic_score"],
-                    "geometric_score": item["geometric_score"],
-                }
-                for item in scored_models
-            ],
-            "status": status,
-        }
+        update = _build_search_update(attributes, scored_models, response_status)
         await db.searches.update_one({"id": record.id}, {"$set": update})
 
         # ─── BACKGROUND: Schedule remaining models for async processing ───
-        remaining = models[attempts:MAX_ATTEMPTS]
         if remaining and status == "completed":
             logger.info(f"[BG] Scheduling {len(remaining)} remaining models for background processing")
             background_tasks.add_task(
@@ -1357,7 +1359,7 @@ async def search_models(request: SearchRequest, background_tasks: BackgroundTask
             attributes=attributes,
             primary_model=primary,
             all_models=approved_models,
-            status=status,
+            status=response_status,
             error_message=None,
             created_at=record.created_at.isoformat(),
         )

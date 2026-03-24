@@ -66,22 +66,51 @@ export default function ViewerPage() {
 
   useEffect(() => {
     let cancelled = false;
-    axios
-      .get(`${API}/history/${id}`)
-      .then((res) => {
-        if (!cancelled) {
-          setData(res.data);
-          setActiveModel(res.data.primary_model ?? null);
+    let pollTimer: ReturnType<typeof setInterval> | null = null;
+    let polling = false;
+
+    const syncRecord = async (isInitialLoad = false) => {
+      if (polling) return;
+      polling = true;
+      try {
+        const res = await axios.get(`${API}/history/${id}`);
+        if (cancelled) return;
+
+        const nextData = res.data as SearchData;
+        setError(null);
+        setData(nextData);
+        setActiveModel((current) => {
+          const candidates = nextData.all_models ?? [];
+          if (current) {
+            const currentUrl = current.url || current.embed_url || "";
+            const matched = candidates.find(
+              (candidate) => (candidate.url || candidate.embed_url || "") === currentUrl,
+            );
+            if (matched) return matched;
+          }
+          return nextData.primary_model ?? candidates[0] ?? null;
+        });
+
+        if (nextData.status !== "processing" && pollTimer) {
+          clearInterval(pollTimer);
+          pollTimer = null;
         }
-      })
-      .catch(() => {
+      } catch {
         if (!cancelled) setError("Search record not found.");
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
+      } finally {
+        polling = false;
+        if (isInitialLoad && !cancelled) setLoading(false);
+      }
+    };
+
+    void syncRecord(true);
+    pollTimer = setInterval(() => {
+      void syncRecord(false);
+    }, 2500);
+
     return () => {
       cancelled = true;
+      if (pollTimer) clearInterval(pollTimer);
     };
   }, [id]);
 
@@ -372,6 +401,19 @@ export default function ViewerPage() {
                   </button>
                 );
               })}
+            </div>
+          </div>
+        )}
+
+        {data?.status === "processing" && (
+          <div className="p-6 border-t border-white/5">
+            <div className="p-4 border border-cyber/20 bg-cyber/5">
+              <p className="font-mono text-xs text-cyber tracking-wide">
+                Processing more models...
+              </p>
+              <p className="font-mono text-[10px] text-slate-500 mt-1">
+                New approved candidates will appear here automatically.
+              </p>
             </div>
           </div>
         )}
