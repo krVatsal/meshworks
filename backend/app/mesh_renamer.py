@@ -388,18 +388,18 @@ def _normalize_context(context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
 def _build_context_line(hint: str, context: Dict[str, Any]) -> str:
     parts: List[str] = []
-    if hint.strip():
-        parts.append(f'user_hint="{_compact_free_text(hint, 120)}"')
     if context.get("prompt"):
-        parts.append(f'prompt="{context["prompt"]}"')
+        parts.append(f'user_prompt="{context["prompt"]}"')   # ← moved to top
+    if hint.strip():
+        parts.append(f'keywords="{_compact_free_text(hint, 120)}"')  # ← renamed for clarity
     if context.get("object_type"):
         parts.append(f'object_type="{context["object_type"]}"')
     if context.get("title"):
         parts.append(f'title="{context["title"]}"')
     if context.get("keywords"):
-        parts.append(f'keywords={json.dumps(context["keywords"])}')
+        parts.append(f'model_keywords={json.dumps(context["keywords"])}')
     if context.get("tags"):
-        parts.append(f'tags={json.dumps(context["tags"][:12])}')
+        parts.append(f'model_tags={json.dumps(context["tags"][:12])}')
     if context.get("description"):
         parts.append(f'description="{context["description"]}"')
     return "Model context: " + ("; ".join(parts) if parts else "unknown object.")
@@ -887,10 +887,13 @@ async def rename_meshes(
             f"{merge_instruction}\n"
             f"{group_line}\n"
             "Field legend: i=index, q=quadrant, vr=relative volume ratio, sy=symmetry estimate, cue=name hint tokens.\n"
-            "Rules: Use the model context as the primary semantic guide and use cue/q/vr/sy only for disambiguation.\n"
-            "Prefer specific semantic names such as head, wheel, handle, roof, wing, torso, base, blade, column, screen, or ornament when supported by context.\n"
-            "Never return placeholder-like names such as object_*, mesh_*, material_*, node_*, part_* unless there is truly no semantic evidence.\n"
-            "Cover every mesh index exactly once.\n"
+            "Rules:\n"
+            "1. user_prompt is the HIGHEST priority signal — derive part names directly from what the user described.\n"
+            "2. Use cue/q/vr/sy only for spatial disambiguation between parts (e.g. left vs right wheel).\n"
+            "3. model_keywords, model_tags, title, and description are LOW priority — use only when user_prompt gives no guidance.\n"
+            "4. Prefer specific semantic names such as head, wheel, handle, roof, wing, torso, base, blade, column, screen, or ornament when supported by user_prompt.\n"
+            "5. Never return placeholder-like names such as object_*, mesh_*, material_*, node_*, part_* unless there is truly no semantic evidence.\n"
+            "6. Cover every mesh index exactly once.\n"
             "No prose. No markdown. Only JSON.\n"
             "Return format: { \"0\": \"name\", \"1\": \"name\" }\n"
             f"Mesh metadata: {json.dumps(chunk, separators=(',', ':'))}"

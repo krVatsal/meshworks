@@ -1142,8 +1142,10 @@ async def _evaluate_single_candidate(
 
         elif score_result.decision == "RENAME":
             rename_context = _build_rename_context(prompt=prompt, attributes=attributes, model=model)
+            segmented_path = await segment_model(str(fetch_result.local_path))
+            rename_input = segmented_path if segmented_path else str(fetch_result.local_path)
             renamed_path, semantic_names = await rename_segmented_model(
-                str(fetch_result.local_path),
+                rename_input,
                 hint=", ".join(attributes.keywords) if attributes.keywords else prompt,
                 context=rename_context,
             )

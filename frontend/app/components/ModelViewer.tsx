@@ -221,6 +221,10 @@ function GltfViewer({ src, highlightLabel, animating, onAnimationEnd }: {
   const [meshLoadVersion, setMeshLoadVersion] = useState(0);
   const highlightLabelRef = useRef<string | null>(highlightLabel);
   const animatingRef = useRef(animating);
+  // after: const animatingRef = useRef(animating);
+  const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
+  const snapTargetRef = useRef<{ pos: THREE.Vector3; up: THREE.Vector3 } | null>(null);
+  const modelRadiusRef = useRef<number>(5);
   useEffect(() => { animatingRef.current = animating; }, [animating]);
 
   const getMeshMaterials = (mesh: THREE.Mesh): THREE.Material[] => {
@@ -353,7 +357,9 @@ function GltfViewer({ src, highlightLabel, animating, onAnimationEnd }: {
 
     // Camera
     const camera = new THREE.PerspectiveCamera(45, width / height, 0.1, 1000);
+    
     camera.position.set(2, 2, 5);
+    cameraRef.current = camera;
 
     // Renderer with better settings for highlighting
     const renderer = new THREE.WebGLRenderer({ 
@@ -459,6 +465,7 @@ function GltfViewer({ src, highlightLabel, animating, onAnimationEnd }: {
             const fov = camera.fov * (Math.PI / 180);
             const dist = Math.abs(maxDim / (2 * Math.tan(fov / 2))) * 1.8;
             camera.position.set(0, 0, dist);
+            modelRadiusRef.current = dist;
             camera.near = dist / 100;
             camera.far = dist * 100;
             camera.updateProjectionMatrix();
@@ -498,15 +505,24 @@ function GltfViewer({ src, highlightLabel, animating, onAnimationEnd }: {
     // Animation loop with post-processing
     const animate = () => {
       animId = requestAnimationFrame(animate);
-      controls?.update();  // required for damping
-      // Only auto-rotate if user hasn't interacted
-      if (!controls || !controls.enabled) {
-        scene.children.forEach((c) => {
-          if ((c as THREE.Group).isGroup) c.rotation.y += 0.003;
-        });
+
+      // Axis snap animation — disables orbit controls while lerping
+      if (snapTargetRef.current) {
+        if (controls) controls.enabled = false;
+        camera.position.lerp(snapTargetRef.current.pos, 0.12);
+        camera.up.lerp(snapTargetRef.current.up, 0.12);
+        camera.lookAt(0, 0, 0);
+        if (camera.position.distanceTo(snapTargetRef.current.pos) < 0.05) {
+          camera.position.copy(snapTargetRef.current.pos);
+          camera.up.copy(snapTargetRef.current.up);
+          camera.lookAt(0, 0, 0);
+          snapTargetRef.current = null;
+          if (controls) { controls.enabled = true; controls.update(); }
+        }
+      } else {
+        controls?.update();
       }
-      
-      // Use post-processing composer if available, otherwise fallback to basic render
+
       if (effectComposer) {
         effectComposer.render();
       } else {
@@ -599,6 +615,11 @@ function GltfViewer({ src, highlightLabel, animating, onAnimationEnd }: {
     >
       {status && <ViewerLoader label={status} />}
       <div ref={mountRef} className="w-full h-full" />
+      <AxisGizmo
+        cameraRef={cameraRef}
+        snapTargetRef={snapTargetRef}
+        modelRadiusRef={modelRadiusRef}
+      />
       <CornerMarkers />
     </div>
   );
@@ -656,6 +677,161 @@ function NoModelState() {
       <p className="font-mono text-xs text-slate-600 mt-2 tracking-wide">
         Try a different search query
       </p>
+    </div>
+  );
+}
+
+function AxisGizmo({
+  cameraRef,
+  snapTargetRef,
+  modelRadiusRef,
+}: {
+  cameraRef: React.RefObject<THREE.PerspectiveCamera | null>;
+  snapTargetRef: React.RefObject<{ pos: THREE.Vector3; up: THREE.Vector3 } | null>;
+  modelRadiusRef: React.RefObject<number>;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const rafRef = useRef<number>(0);
+
+  // Each world axis: direction, color, label, and which side the camera up-vector should use
+  const AXES = [
+    { label: "X", dir: [1, 0, 0], neg: [-1, 0, 0], up: [0, 1, 0],  negUp: [0, 1, 0],  color: "#ef4444", negColor: "#7f1d1d" },
+    { label: "Y", dir: [0, 1, 0], neg: [0, -1, 0], up: [0, 0, -1], negUp: [0, 0, 1],  color: "#22c55e", negColor: "#14532d" },
+    { label: "Z", dir: [0, 0, 1], neg: [0, 0, -1], up: [0, 1, 0],  negUp: [0, 1, 0],  color: "#3b82f6", negColor: "#1e3a8a" },
+  ] as const;
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    const SIZE = 90, CX = SIZE / 2, CY = SIZE / 2, R = 32;
+
+    const project = (m: number[], vx: number, vy: number, vz: number) => ({
+      x: CX + (m[0] * vx + m[1] * vy + m[2] * vz) * R,
+      y: CY - (m[4] * vx + m[5] * vy + m[6] * vz) * R,
+      z:       m[8] * vx + m[9] * vy + m[10]* vz,   // depth for sorting
+    });
+
+    const draw = () => {
+      ctx.clearRect(0, 0, SIZE, SIZE);
+      const camera = cameraRef.current;
+      if (!camera) { rafRef.current = requestAnimationFrame(draw); return; }
+
+      camera.updateMatrixWorld();
+      const m = camera.matrixWorld.elements;
+
+      // Build all 6 axis endpoints (pos + neg for each)
+      type Item = { x: number; y: number; z: number; color: string; r: number; label?: string };
+      const items: Item[] = [];
+      for (const ax of AXES) {
+        const p = project(m, ax.dir[0], ax.dir[1], ax.dir[2]);
+        const n = project(m, ax.neg[0], ax.neg[1], ax.neg[2]);
+        items.push({ ...p, color: ax.color,    r: 9,  label: ax.label });
+        items.push({ ...n, color: ax.negColor, r: 5 });
+      }
+      // Paint back-to-front
+      items.sort((a, b) => a.z - b.z);
+
+      for (const item of items) {
+        // Line from center
+        ctx.beginPath();
+        ctx.moveTo(CX, CY);
+        ctx.lineTo(item.x, item.y);
+        ctx.strokeStyle = item.color;
+        ctx.lineWidth = item.r > 6 ? 1.5 : 1;
+        ctx.globalAlpha = item.r > 6 ? 0.85 : 0.35;
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+
+        // Circle
+        ctx.beginPath();
+        ctx.arc(item.x, item.y, item.r, 0, Math.PI * 2);
+        ctx.fillStyle = item.color;
+        ctx.globalAlpha = item.r > 6 ? 1 : 0.45;
+        ctx.fill();
+        ctx.globalAlpha = 1;
+
+        // Label
+        if (item.label) {
+          ctx.font = "bold 9px monospace";
+          ctx.fillStyle = "#fff";
+          ctx.textAlign = "center";
+          ctx.textBaseline = "middle";
+          ctx.fillText(item.label, item.x, item.y);
+        }
+      }
+
+      // Center dot
+      ctx.beginPath();
+      ctx.arc(CX, CY, 2.5, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(255,255,255,0.5)";
+      ctx.fill();
+
+      rafRef.current = requestAnimationFrame(draw);
+    };
+
+    draw();
+    return () => cancelAnimationFrame(rafRef.current);
+  }, []);
+
+  const handleClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    const camera = cameraRef.current;
+    if (!camera) return;
+
+    const rect = (e.target as HTMLCanvasElement).getBoundingClientRect();
+    // Map click to canvas coords (canvas is 90x90, rendered at CSS size)
+    const SIZE = 90, CX = SIZE / 2, CY = SIZE / 2, R = 32;
+    const mx = ((e.clientX - rect.left) / rect.width) * SIZE;
+    const my = ((e.clientY - rect.top) / rect.height) * SIZE;
+
+    camera.updateMatrixWorld();
+    const m = camera.matrixWorld.elements;
+
+    const project = (vx: number, vy: number, vz: number) => ({
+      x: CX + (m[0]*vx + m[1]*vy + m[2]*vz) * R,
+      y: CY - (m[4]*vx + m[5]*vy + m[6]*vz) * R,
+    });
+
+    // All 6 snappable views
+    const views = AXES.flatMap((ax) => [
+      { dir: ax.dir, up: ax.up },
+      { dir: ax.neg, up: ax.negUp },
+    ]);
+
+    let best: (typeof views)[0] | null = null;
+    let bestDist = 14; // click radius in canvas px
+
+    for (const v of views) {
+      const p = project(v.dir[0], v.dir[1], v.dir[2]);
+      const d = Math.hypot(mx - p.x, my - p.y);
+      if (d < bestDist) { bestDist = d; best = v; }
+    }
+
+    if (!best) return;
+    const dist = modelRadiusRef.current;
+    snapTargetRef.current = {
+      pos: new THREE.Vector3(...best.dir).multiplyScalar(dist),
+      up:  new THREE.Vector3(...best.up),
+    };
+  };
+
+  return (
+    <div
+      className="absolute bottom-12 right-3 pointer-events-auto"
+      style={{ width: 90, height: 90, zIndex: 10 }}
+      title="Click an axis to snap view"
+    >
+      {/* subtle border matching the cyber aesthetic */}
+      <div className="absolute inset-0 border border-cyber/20" />
+      <canvas
+        ref={canvasRef}
+        width={90}
+        height={90}
+        onClick={handleClick}
+        style={{ cursor: "crosshair", width: "100%", height: "100%" }}
+      />
     </div>
   );
 }

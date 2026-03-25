@@ -845,6 +845,25 @@ def main():
     # Load all sub-meshes independently — NO merging
     named_meshes = load_glb(input_path)
 
+    if len(named_meshes) >= a.max_segments:
+        print(f"\n[skip]  Model already has {len(named_meshes)} sub-meshes "
+            f"(>= max_segments={a.max_segments}). Skipping segmentation.")
+        pal   = np.tile(PALETTE, (len(named_meshes) // len(PALETTE) + 1, 1))
+        scene = trimesh.Scene()
+        for sid, (mesh_name, mesh) in enumerate(named_meshes):
+            col = (np.array([*pal[sid], 1.0]) * 255).astype(np.uint8)
+            sub = trimesh.Trimesh(
+                vertices=np.array(mesh.vertices),
+                faces=np.array(mesh.faces),
+                vertex_colors=np.tile(col, (len(mesh.vertices), 1)),
+                process=False,
+            )
+            node_name = f"Segment_{sid:02d}"
+            scene.add_geometry(sub, node_name=node_name, geom_name=node_name)
+            print(f"[out]   {node_name} -> {len(mesh.faces):,} faces  (from {mesh_name})")
+        scene.export(output_path)
+        print(f"\nSaved {len(named_meshes)} segments -> {output_path}")
+        return
     # Segment each sub-mesh independently
     all_results = []
     for mesh_name, mesh in named_meshes:
