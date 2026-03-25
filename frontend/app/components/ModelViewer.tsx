@@ -8,6 +8,7 @@ interface ModelData {
   title: string;
   url?: string;
   embed_url?: string;
+  originalUrl?: string;
 }
 
 export default function ModelViewer({
@@ -29,6 +30,7 @@ export default function ModelViewer({
   if (model.url) {
     return <GltfViewer 
       src={model.url} 
+      originalSrc={model.originalUrl ?? null}
       highlightLabel={highlightLabel ?? null}
       animating={animating}
       onAnimationEnd={onAnimationEnd}
@@ -204,8 +206,9 @@ function bestMeshMatch(meshes: THREE.Mesh[], label: string): THREE.Mesh | null {
   return bestScore >= 30 ? best : null;
 }
 
-function GltfViewer({ src, highlightLabel, animating, onAnimationEnd }: { 
-  src: string; 
+function GltfViewer({ src, originalSrc, highlightLabel, animating, onAnimationEnd }: { 
+  src: string;
+  originalSrc?: string | null;
   highlightLabel: string | null;
   animating?: { segments: {name: string; description: string}[] } | null;
   onAnimationEnd?: () => void;
@@ -215,6 +218,8 @@ function GltfViewer({ src, highlightLabel, animating, onAnimationEnd }: {
     "Loading Three.js renderer..."
   );
   const [outlineColor] = useState(new THREE.Color(0x00f0ff));
+  const [showOriginal, setShowOriginal] = useState(false);
+  const activeSrc = showOriginal && originalSrc ? originalSrc : src;
   const outlineLayerRef = useRef<THREE.Scene | null>(null);
   const materialDefaultsRef = useRef<Map<string, any>>(new Map());
   const meshesRef = useRef<THREE.Mesh[]>([]);
@@ -445,9 +450,9 @@ function GltfViewer({ src, highlightLabel, animating, onAnimationEnd }: {
         );
         const loader = new GLTFLoader();
         // Resolve relative URLs against the frontend origin
-        const resolvedSrc = src.startsWith("/")
-          ? `${window.location.origin}${src}`
-          : src;
+        const resolvedSrc = activeSrc.startsWith("/")
+          ? `${window.location.origin}${activeSrc}`
+          : activeSrc;
 
         loader.load(
           resolvedSrc,
@@ -556,7 +561,7 @@ function GltfViewer({ src, highlightLabel, animating, onAnimationEnd }: {
         container.removeChild(renderer.domElement);
       }
     };
-  }, [src]);
+  }, [activeSrc]);
 
   useEffect(() => {
     // Update ref for use in other contexts
@@ -615,6 +620,15 @@ function GltfViewer({ src, highlightLabel, animating, onAnimationEnd }: {
     >
       {status && <ViewerLoader label={status} />}
       <div ref={mountRef} className="w-full h-full" />
+      {originalSrc && (
+        <button
+          onClick={() => setShowOriginal(v => !v)}
+          className="absolute top-3 right-16 z-10 px-3 py-1.5 bg-black/70 border border-cyber/40 text-cyber font-mono text-[10px] tracking-widest hover:bg-cyber/10 transition-colors"
+        >
+          {showOriginal ? "SEGMENTED VIEW" : "ORIGINAL TEXTURE"}
+        </button>
+      )}
+
       <AxisGizmo
         cameraRef={cameraRef}
         snapTargetRef={snapTargetRef}

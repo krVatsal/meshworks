@@ -32,6 +32,7 @@ interface ModelData {
   source_url: string;
   source_domain: string;
   is_downloadable?: boolean;
+  originalUrl?: string;
 }
 
 interface SearchAttributes {
@@ -63,6 +64,7 @@ export default function ViewerPage() {
   const [highlightedLabel, setHighlightedLabel] = useState<string | null>(null);
   const [animating, setAnimating] = useState<{segments: {name: string; description: string}[]} | null>(null);
   const [loadingStory, setLoadingStory] = useState(false);
+  
 
   useEffect(() => {
     let cancelled = false;
@@ -142,6 +144,13 @@ export default function ViewerPage() {
     setHighlightedLabel(null);
   }, [activeModel?.url, activeModel?.embed_url]);
 
+  const originalUrl = (() => {
+    const url = activeModel?.url ?? "";
+    if (!url.startsWith("/api/output/")) return null;
+    const stem = url.replace("/api/output/", "").replace(/\.glb$/i, "");
+    return `/api/output/${stem}_original.glb`;
+  })();
+
   if (loading) return <ViewerSkeleton />;
   if (error)
     return (
@@ -172,7 +181,7 @@ export default function ViewerPage() {
       {/* 3D Viewer */}
       <div className="flex-1 relative bg-obsidian border-r border-white/5 min-h-[50vh] lg:min-h-0">
         <ModelViewer 
-          model={activeModel} 
+          model={activeModel ? { ...activeModel, originalUrl: originalUrl ?? undefined } : null}
           highlightLabel={highlightedLabel}
           animating={animating}
           onAnimationEnd={() => setAnimating(null)}

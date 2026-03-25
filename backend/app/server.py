@@ -386,6 +386,11 @@ async def segment_model(local_path: str) -> Optional[str]:
         shutil.copy2(src, dst)
     logger.info(f"[segment] Copied {filename} -> {dst}")
 
+    # Save original for texture toggle
+    original_dst = OUTPUT_DIR / (src.stem + "_original.glb")
+    shutil.copy2(src, original_dst)
+    logger.info(f"[segment] Saved original -> {original_dst}")
+
     script = APP_DIR / "segment_mesh.py"
     if not script.exists():
         logger.error(f"[segment] segment_glb.py not found at {script}")
@@ -730,7 +735,10 @@ async def _cached_record_is_servable(record: dict) -> bool:
         logger.warning("[cache] Skipping stale cached record; missing local model file: %s", filename)
         return False
 
-    return True
+    filename = Path(model_url).name
+    if filename and (OUTPUT_DIR / filename).exists():
+        return True
+    return False
 
 
 def _semantic_cache_score(
@@ -862,12 +870,18 @@ async def search_models_with_tavily(attributes: SearchAttributes) -> List[ModelI
                 max_results=25,
                 include_answer=False,
             )
-        try:
-            result = await loop.run_in_executor(None, _call)
-            return result.get("results", [])
-        except Exception as e:
-            logger.error(f"Tavily error for '{query}': {e}")
-            return []
+        MAX_RETRIES = 5
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                result = await loop.run_in_executor(None, _call)
+                return result.get("results", [])
+            except Exception as e:
+                logger.warning(f"Tavily error for '{query}' (attempt {attempt}/{MAX_RETRIES}): {e}")
+                if attempt < MAX_RETRIES:
+                    await asyncio.sleep(2 ** (attempt - 1))  # 1s, 2s, 4s, 8s backoff
+                else:
+                    logger.error(f"Tavily failed after {MAX_RETRIES} attempts for '{query}'")
+                    return []
 
     all_raw = await asyncio.gather(*[_search(q) for q in queries])
 
@@ -1064,9 +1078,12 @@ async def _evaluate_single_candidate(
             f"is_scorable: {fetch_result.is_scorable}, local_path: {fetch_result.local_path}"
         )
 
-        if not (fetch_result.is_scorable and fetch_result.local_path):
-            logger.warning(f"[{idx}/{total}] ⚠️  Model NOT SCORABLE ({fetch_result.status.value})")
-            return None, None, None
+        # Save original before any segmentation/renaming
+        original_src = Path(fetch_result.local_path)
+        original_dst = OUTPUT_DIR / (original_src.stem + "_original.glb")
+        OUTPUT_DIR.mkdir(exist_ok=True)
+        shutil.copy2(original_src, original_dst)
+        logger.info(f"[original] Saved -> {original_dst.name}")
 
         metadata = fetch_result.metadata if fetch_result.metadata else {
             "title": model.title,
@@ -1115,10 +1132,12 @@ async def _evaluate_single_candidate(
                        "url": f"/api/output/{Path(final_path).name}",
                        "description": (model.description or "") + " [segmented + renamed]"}
                 )
+                original_name = Path(fetch_result.local_path).stem + "_original.glb"
                 scored_dict = {
                     "model": model, "score": score_result.final_score,
                     "decision": score_result.decision, "is_labelled": True,
                     "node_names": semantic_names,
+                    "original_url": f"/api/output/{original_name}",
                     "semantic_score": score_result.semantic.combined,
                     "geometric_score": score_result.geometric.combined,
                 }
@@ -1277,6 +1296,82 @@ async def search_models(request: SearchRequest, background_tasks: BackgroundTask
     doc = record.model_dump()
     doc["created_at"] = doc["created_at"].isoformat()
     await db.searches.insert_one(doc)
+
+    # ─── TEST MODEL SHORTCUT ──────────────────────────────────────────────────
+    TEST_MODELS_DIR = APP_DIR / "test_models"
+    test_glb_name = prompt.strip().lower().replace(" ", "_") + ".glb"
+    test_glb_path = TEST_MODELS_DIR / test_glb_name
+
+    if test_glb_path.exists():
+        logger.info(f"[test] Found test model: {test_glb_path} — skipping search and scoring")
+        try:
+            rename_context = _build_rename_context(
+                prompt=prompt,
+                attributes=attributes,
+                model=ModelInfo(
+                    type="glb",
+                    title=prompt,
+                    source_url="local",
+                    source_domain="test_models",
+                    description=f"Test model for: {prompt}",
+                    tags=attributes.keywords,
+                ),
+            )
+            segmented_path = await segment_model(str(test_glb_path))
+            if segmented_path:
+                renamed_path, semantic_names = await rename_segmented_model(
+                    segmented_path,
+                    hint=f"{prompt} — this is a {attributes.object_type}. Expected parts: {', '.join(attributes.keywords)}.",
+                    context=rename_context,
+                )
+                final_path = renamed_path or segmented_path
+                semantic_names = semantic_names or []
+            else:
+                final_path = _copy_to_output(str(test_glb_path))
+                semantic_names = []
+
+            output_filename = Path(final_path).name
+            primary = ModelInfo(
+                type="glb",
+                url=f"/api/output/{output_filename}",
+                title=prompt,
+                source_url=f"/api/output/{output_filename}",
+                source_domain="test_models",
+                description=f"Test model: {prompt}",
+                tags=attributes.keywords,
+            )
+
+            update = {
+                "attributes": attributes.model_dump(),
+                "primary_model": primary.model_dump(),
+                "all_models": [primary.model_dump()],
+                "scored_results": [{
+                    "model": primary.model_dump(),
+                    "score": 1.0,
+                    "decision": "TEST",
+                    "is_labelled": True,
+                    "node_names": semantic_names,
+                    "semantic_score": 1.0,
+                    "geometric_score": 1.0,
+                }],
+                "status": "completed",
+            }
+            await db.searches.update_one({"id": record.id}, {"$set": update})
+
+            return SearchResponse(
+                id=record.id,
+                original_prompt=prompt,
+                attributes=attributes,
+                primary_model=primary,
+                all_models=[primary],
+                status="completed",
+                error_message=None,
+                created_at=record.created_at.isoformat(),
+            )
+        except Exception as e:
+            logger.error(f"[test] Test model pipeline failed: {e}", exc_info=True)
+            # Fall through to normal pipeline
+    # ─────────────────────────────────────────────────────────────────────────
 
     try:
         models = await search_models_with_tavily(attributes)
@@ -2069,8 +2164,23 @@ async def blender_clear_conversation(conversation_id: str):
 app.include_router(api_router)
 
 
+@app.on_event("startup")
+async def startup_cleanup():
+    """Clean up any leftover files from a previous session on startup."""
+    for folder in [INPUT_DIR, OUTPUT_DIR]:
+        if folder.exists():
+            for f in folder.glob("*.glb"):
+                f.unlink(missing_ok=True)
+    logger.info("[startup] Cleared stale GLB files from input/ and output/")
+
 @app.on_event("shutdown")
 async def shutdown_db():
     db_client.close()
     if blender_client.is_connected:
         await blender_client.disconnect()
+    # Delete all GLBs from input/ and output/ on session end
+    for folder in [INPUT_DIR, OUTPUT_DIR]:
+        if folder.exists():
+            for f in folder.glob("*.glb"):
+                f.unlink(missing_ok=True)
+    logger.info("[shutdown] Cleared GLB files from input/ and output/")

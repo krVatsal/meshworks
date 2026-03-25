@@ -845,7 +845,7 @@ def main():
     # Load all sub-meshes independently — NO merging
     named_meshes = load_glb(input_path)
 
-    if len(named_meshes) >= a.max_segments:
+    if len(named_meshes) >= 7:
         print(f"\n[skip]  Model already has {len(named_meshes)} sub-meshes "
             f"(>= max_segments={a.max_segments}). Skipping segmentation.")
         pal   = np.tile(PALETTE, (len(named_meshes) // len(PALETTE) + 1, 1))
