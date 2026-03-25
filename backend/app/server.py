@@ -78,6 +78,39 @@ app.add_middleware(
 class SegmentNarrationResponse(BaseModel):
     segments: List[Dict[str, str]]  # [{"name": "...", "description": "..."}]
 
+
+def _infer_narration_domain(
+    prompt_context: str,
+    object_type: str,
+    model_title: str,
+    model_description: str,
+    model_tags: List[str],
+) -> str:
+    text = " ".join(
+        [
+            prompt_context or "",
+            object_type or "",
+            model_title or "",
+            model_description or "",
+            " ".join(model_tags or []),
+        ]
+    ).lower()
+
+    if any(word in text for word in ["human", "humanoid", "person", "character", "man", "woman", "robot", "android", "knight", "soldier"]):
+        return "humanoid"
+    if any(word in text for word in ["bird", "avian", "seabird", "eagle", "owl", "parrot", "penguin", "duck", "chicken", "booby"]):
+        return "bird"
+    if any(word in text for word in ["animal", "creature", "dog", "cat", "horse", "lion", "tiger", "wolf", "fish", "shark", "whale", "dinosaur"]):
+        return "animal"
+    if any(word in text for word in ["car", "vehicle", "truck", "bus", "motorcycle", "bike", "aircraft", "plane", "jet", "helicopter", "boat", "ship"]):
+        return "vehicle"
+    if any(word in text for word in ["building", "house", "temple", "castle", "tower", "bridge", "furniture", "chair", "table", "sofa"]):
+        return "structure"
+    if any(word in text for word in ["tool", "weapon", "machine", "device", "engine", "mechanical", "industrial"]):
+        return "mechanical"
+    return "generic_object"
+
+
 @api_router.get("/narration/{search_id}", response_model=SegmentNarrationResponse)
 async def get_segment_narration(search_id: str, model_url: str = Query(default="")):
     record = await db.searches.find_one({"id": search_id}, {"_id": 0})
@@ -118,6 +151,14 @@ async def get_segment_narration(search_id: str, model_url: str = Query(default="
     object_type = attributes.get("object_type", "object")
     model_title = requested_model.get("title") or "Unknown model"
     model_description = requested_model.get("description") or ""
+    model_tags = [str(tag) for tag in (requested_model.get("tags") or []) if str(tag).strip()]
+    narration_domain = _infer_narration_domain(
+        prompt_context,
+        object_type,
+        model_title,
+        model_description,
+        model_tags,
+    )
 
     # Ask LLM for one description per segment
     def _call():
@@ -130,13 +171,21 @@ async def get_segment_narration(search_id: str, model_url: str = Query(default="
                     f"The full model is: {prompt_context} (type: {object_type})\n"
                     f"Model title: {model_title}\n"
                     f"Model description: {model_description}\n"
+                    f"Model tags: {json.dumps(model_tags)}\n"
+                    f"Narration domain: {narration_domain}\n"
                     f"For each segment name below, write a short spoken explanation suitable for narration.\n"
                     f"Adapt the explanation to the kind of model:\n"
-                    f"- For living things, explain the part's role, structure, or biological function.\n"
+                    f"- For humanoids, explain the part's role, structure, or anatomical function.\n"
+                    f"- For animals or birds, explain the species-appropriate body part without switching to human anatomy.\n"
                     f"- For machines, vehicles, tools, or devices, explain the component's purpose, placement, or how it contributes to operation.\n"
                     f"- For buildings, furniture, or crafted objects, explain the structural, functional, or decorative role of the part.\n"
                     f"- If the name is ambiguous, give the most likely plain-English explanation based on the full model context.\n"
                     f"Rules:\n"
+                    f"- Use the narration domain as the default interpretation for every segment.\n"
+                    f"- Do NOT assume human anatomy unless the domain or model context clearly indicates a person, character, humanoid, or robot.\n"
+                    f"- If a neutral label like head, body, arm, leg, jaw, neck, or shoulder appears on a non-humanoid model, reinterpret it for that domain instead of describing a human body part.\n"
+                    f"- For vehicles or machines, words like arm, head, body, neck, jaw, spine, or tail may refer to mechanical assemblies, housings, linkages, booms, brackets, or rear sections.\n"
+                    f"- For birds or animals, prefer species-appropriate wording such as beak, wing, tail, breast, flank, claw, or foreleg rather than human-specific anatomy.\n"
                     f"- Focus on what the part is, what it does, where it is, or why it matters.\n"
                     f"- Use natural, listener-friendly language for a general audience.\n"
                     f"- Keep each description to 1-2 sentences.\n"
