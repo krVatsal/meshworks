@@ -1,0 +1,23 @@
+services:
+  backend:
+    image: krvatsal/meshworks-backend:latest
+    container_name: meshworks-backend
+    restart: always
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - backend_output:/app/app/output
+
+  frontend:
+    image: krvatsal/meshworks-frontend:latest
+    container_name: meshworks-frontend
+    restart: always
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+
+volumes:
+  backend_output:
