@@ -73,6 +73,8 @@ def init_db():
 # Initialize immediately for any early attribute access
 init_db()
 
+ENABLE_GRIDFS_CACHE = os.environ.get("ENABLE_GRIDFS_CACHE", "").strip().lower() in {"1", "true", "yes", "on"}
+
 groq_client = Groq(api_key=os.environ.get('GROQ_API_KEY', ''))
 tavily_client = TavilyClient(api_key=os.environ.get('TAVILY_API_KEY', ''))
 
