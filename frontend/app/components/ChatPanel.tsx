@@ -34,7 +34,7 @@ interface ChatPanelProps {
 
 type NarrationState = "idle" | "playing" | "paused";
 
-const API_BASE = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
+const API_BASE = process.env.NEXT_PUBLIC_BACKEND_URL || "";
 
 /* ─────────────────────────────────────────────────────────────────────
    WAVEFORM  – animated bars shown while speaking
