@@ -175,9 +175,10 @@ async def get_segment_narration(search_id: str, model_url: str = Query(default="
     )
 
     # Ask LLM for one description per segment
+    groq_model = os.environ.get("GROQ_MODEL", "qwen/qwen3.8-27b")
     def _call():
         return groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=groq_model,
             messages=[{
                 "role": "user",
                 "content": (
@@ -870,28 +871,51 @@ async def refine_prompt_with_groq(prompt: str) -> SearchAttributes:
         '- "medieval knight in armor" -> {"object_type":"character","style":"medieval","keywords":["knight","armor","medieval","warrior"],"refined_query":"medieval knight armor warrior","confidence":0.92}'
     )
 
-    def _call():
-        return groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt},
-            ],
-            response_format={"type": "json_object"},
-            max_tokens=512,
-            temperature=0.2,
-        )
+    candidate_models = [
+        os.environ.get("GROQ_MODEL", "qwen/qwen3.8-27b"),
+        "qwen/qwen3.8-27b",
+        "llama-3.3-70b-versatile",
+        "llama-3.1-70b-versatile",
+        "llama3-70b-8192",
+    ]
+    seen = set()
+    models_to_try = [m for m in candidate_models if m and not (m in seen or seen.add(m))]
 
     loop = asyncio.get_event_loop()
-    response = await loop.run_in_executor(None, _call)
-    data = json.loads(response.choices[0].message.content)
+    for model_name in models_to_try:
+        try:
+            def _call(m=model_name):
+                return groq_client.chat.completions.create(
+                    model=m,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": prompt},
+                    ],
+                    response_format={"type": "json_object"},
+                    max_tokens=512,
+                    temperature=0.2,
+                )
 
+            response = await loop.run_in_executor(None, _call)
+            data = json.loads(response.choices[0].message.content)
+
+            return SearchAttributes(
+                object_type=data.get("object_type", "object"),
+                style=data.get("style", "realistic"),
+                keywords=data.get("keywords", [prompt]),
+                refined_query=data.get("refined_query", prompt),
+                confidence=float(data.get("confidence", 0.8)),
+            )
+        except Exception as e:
+            logger.warning(f"[refine_prompt] Groq model '{model_name}' failed: {e}")
+
+    logger.warning(f"[refine_prompt] All Groq models failed. Using heuristic attributes for: {prompt}")
     return SearchAttributes(
-        object_type=data.get("object_type", "object"),
-        style=data.get("style", "realistic"),
-        keywords=data.get("keywords", [prompt]),
-        refined_query=data.get("refined_query", prompt),
-        confidence=float(data.get("confidence", 0.8)),
+        object_type="object",
+        style="realistic",
+        keywords=[k.strip() for k in prompt.split() if len(k) > 2] or [prompt],
+        refined_query=prompt,
+        confidence=0.7,
     )
 
 
