@@ -46,6 +46,8 @@ interface SearchData {
   id: string;
   original_prompt: string;
   status: string;
+  is_cached?: boolean;
+  last_accessed_at?: string;
   primary_model?: ModelData;
   all_models?: ModelData[];
   attributes?: SearchAttributes;
@@ -195,6 +197,21 @@ export default function ViewerPage() {
         >
           <ArrowLeft size={11} /> BACK
         </button>
+
+        {/* Cache eviction warning */}
+        {data?.is_cached === false && data?.status !== "no_model" && (
+          <div className="absolute top-16 left-4 right-4 z-20 p-2.5 bg-black/90 border border-amber-500/40 backdrop-blur-md flex items-center justify-between gap-4">
+            <span className="font-mono text-[10px] text-amber-300 tracking-wider">
+              ⚠️ Model was evicted from the 4GB server cache by LRU policy.
+            </span>
+            <button
+              onClick={() => router.push(`/?prompt=${encodeURIComponent(data?.original_prompt || "")}`)}
+              className="px-2 py-1 bg-amber-500/20 border border-amber-500/50 text-amber-300 hover:bg-amber-500/30 font-mono text-[10px] tracking-widest transition-colors shrink-0"
+            >
+              RE-SEARCH MODEL
+            </button>
+          </div>
+        )}
 
         {/* Model type badge */}
         {modelType && modelType !== "none" && (

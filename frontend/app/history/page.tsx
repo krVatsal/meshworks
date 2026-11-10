@@ -15,6 +15,8 @@ interface HistoryItem {
   id: string;
   original_prompt: string;
   created_at: string;
+  last_accessed_at?: string;
+  is_cached?: boolean;
   status: string;
   primary_model?: HistoryModel;
   attributes?: { object_type: string; style: string };
@@ -211,11 +213,15 @@ function HistoryCard({
         </div>
 
         {/* Status */}
-        {item.status === "no_model" && (
+        {item.status === "no_model" ? (
           <p className="mt-2 font-mono text-[9px] tracking-widest text-neon-red/60">
             NO MODEL FOUND
           </p>
-        )}
+        ) : item.is_cached === false ? (
+          <p className="mt-2 font-mono text-[9px] tracking-widest text-amber-400/80">
+            CACHE EXPIRED • CLICK TO RE-FETCH
+          </p>
+        ) : null}
       </div>
 
       {/* Corner accent */}

@@ -40,6 +40,7 @@ from app.sketchfab_fetcher import (
     FetchResult,
     SketchfabMetadata
 )
+from app.lru_cache import LRUStorageManager
 from app.conversation_service import (
     ChatRequest,
     ChatResponse,
@@ -226,15 +227,27 @@ async def get_segment_narration(search_id: str, model_url: str = Query(default="
 APP_DIR    = Path(__file__).parent          # …/app/
 INPUT_DIR  = APP_DIR / "input"
 OUTPUT_DIR = APP_DIR / "output"
+lru_manager = LRUStorageManager(output_dir=OUTPUT_DIR, input_dir=INPUT_DIR)
 
-# copy to ouput helper
+# copy to output helper with LRU quota management
 def _copy_to_output(local_path: str) -> Optional[str]:
-    """Copy a downloaded model to app/output/ and return the output path."""
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    """Copy a downloaded model to app/output/ respecting the 4GB LRU cache limit."""
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     src = Path(local_path)
     dst = OUTPUT_DIR / src.name
+    try:
+        size = src.stat().st_size
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(lru_manager.evict_if_needed(size, db=db))
+        except RuntimeError:
+            pass
+    except Exception:
+        pass
+
     if src.resolve() != dst.resolve():
         shutil.copy2(src, dst)
+    lru_manager.touch(dst.name)
     return str(dst)
 
 
@@ -480,6 +493,8 @@ class SearchResponse(BaseModel):
     status: str
     error_message: Optional[str]
     created_at: str
+    last_accessed_at: Optional[str] = None
+    is_cached: Optional[bool] = True
 
 class ModelScoreRequest(BaseModel):
     model_url: str
@@ -612,6 +627,20 @@ def record_to_response(record: dict) -> SearchResponse:
     else:
         created_str = str(created)
 
+    # Dynamic cache check: verify if the model file is still on disk in output/
+    primary = record.get("primary_model") or {}
+    model_url = primary.get("url") or ""
+    is_cached = True
+    if "/api/output/" in model_url:
+        filename = model_url.split("/api/output/")[-1]
+        is_cached = (OUTPUT_DIR / filename).is_file()
+
+    last_acc = record.get("last_accessed_at")
+    if isinstance(last_acc, datetime):
+        last_acc = last_acc.isoformat()
+    elif not last_acc:
+        last_acc = created_str
+
     return SearchResponse(
         id=record.get("id", ""),
         original_prompt=record.get("original_prompt", ""),
@@ -621,6 +650,8 @@ def record_to_response(record: dict) -> SearchResponse:
         status=record.get("status", "unknown"),
         error_message=record.get("error_message"),
         created_at=created_str,
+        last_accessed_at=last_acc,
+        is_cached=is_cached,
     )
 
 
@@ -1523,10 +1554,11 @@ async def search_models(request: SearchRequest, background_tasks: BackgroundTask
 
 @api_router.get("/history", response_model=List[SearchResponse])
 async def get_history(limit: int = Query(default=20, le=50)):
+    # Sort by LRU (last_accessed_at descending), then created_at descending
     records = await (
         db.searches
         .find({"status": {"$in": ["completed", "no_model"]}}, {"_id": 0})
-        .sort("created_at", -1)
+        .sort([("last_accessed_at", -1), ("created_at", -1)])
         .limit(limit)
         .to_list(limit)
     )
@@ -1538,14 +1570,31 @@ async def get_history_item(search_id: str):
     record = await db.searches.find_one({"id": search_id}, {"_id": 0})
     if not record:
         raise HTTPException(status_code=404, detail="Search not found")
+
+    now = datetime.now(timezone.utc).isoformat()
+    await db.searches.update_one({"id": search_id}, {"$set": {"last_accessed_at": now}})
+    record["last_accessed_at"] = now
+
+    model_url = (record.get("primary_model") or {}).get("url") or ""
+    if "/api/output/" in model_url:
+        filename = model_url.split("/api/output/")[-1]
+        await lru_manager.touch_async(filename, db=db)
+
     return record_to_response(record)
 
 
 @api_router.delete("/history/{search_id}")
 async def delete_history_item(search_id: str):
-    result = await db.searches.delete_one({"id": search_id})
-    if result.deleted_count == 0:
+    record = await db.searches.find_one({"id": search_id})
+    if not record:
         raise HTTPException(status_code=404, detail="Search not found")
+
+    model_url = (record.get("primary_model") or {}).get("url") or ""
+    if "/api/output/" in model_url:
+        filename = model_url.split("/api/output/")[-1]
+        (OUTPUT_DIR / filename).unlink(missing_ok=True)
+
+    await db.searches.delete_one({"id": search_id})
     return {"message": "Deleted"}
 
 
@@ -1623,29 +1672,47 @@ async def download_model(url: str):
 
 @api_router.get("/output/{filename}")
 async def serve_output_file(filename: str):
-    """Serve segmented GLB files from GridFS or local app/output/ over HTTP."""
-    # Try GridFS first
-    try:
-        grid_out = await fs.open_download_stream_by_name(filename)
-        file_data = await grid_out.read()
-        
-        return StreamingResponse(
-            iter([file_data]),
-            media_type="model/gltf-binary",
-            headers={"Content-Length": str(len(file_data))}
-        )
-    except Exception as e:
-        logger.warning(f"GridFS not found for {filename}, falling back to local: {e}")
-
-    # Fallback to local file
+    """Serve segmented GLB files with LRU touch tracking, or restore from GridFS."""
     file_path = OUTPUT_DIR / filename
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail=f"File not found: {filename}")
-    return FileResponse(
-        path=str(file_path),
-        filename=filename,
-        media_type="model/gltf-binary"
-    )
+    if file_path.exists():
+        await lru_manager.touch_async(filename, db=db)
+        return FileResponse(
+            path=str(file_path),
+            filename=filename,
+            media_type="model/gltf-binary"
+        )
+
+    # Try GridFS fallback if enabled
+    if ENABLE_GRIDFS_CACHE:
+        try:
+            grid_out = await fs.open_download_stream_by_name(filename)
+            file_data = await grid_out.read()
+            await lru_manager.evict_if_needed(len(file_data), db=db)
+            async with aiofiles.open(file_path, "wb") as f:
+                await f.write(file_data)
+            await lru_manager.touch_async(filename, db=db)
+            return StreamingResponse(
+                iter([file_data]),
+                media_type="model/gltf-binary",
+                headers={"Content-Length": str(len(file_data))}
+            )
+        except Exception as e:
+            logger.warning(f"GridFS not found for {filename}, falling back to local: {e}")
+
+    raise HTTPException(status_code=404, detail=f"Model cache expired or file not found: {filename}")
+
+
+@api_router.get("/cache/stats")
+async def get_cache_stats():
+    """Returns LRU model cache statistics and storage quota usage."""
+    used_bytes = lru_manager.get_current_cache_size()
+    return {
+        "used_bytes": used_bytes,
+        "used_mb": round(used_bytes / (1024 * 1024), 2),
+        "max_mb": lru_manager.max_mb,
+        "usage_percent": round((used_bytes / lru_manager.max_bytes) * 100, 2) if lru_manager.max_bytes > 0 else 0,
+        "cached_models": len([f for f in OUTPUT_DIR.glob("*.glb") if f.is_file()])
+    }
 
 #image search 
 
@@ -2168,21 +2235,21 @@ app.include_router(api_router)
 
 @app.on_event("startup")
 async def startup_cleanup():
-    """Clean up any leftover files from a previous session on startup."""
-    for folder in [INPUT_DIR, OUTPUT_DIR]:
-        if folder.exists():
-            for f in folder.glob("*.glb"):
-                f.unlink(missing_ok=True)
-    logger.info("[startup] Cleared stale GLB files from input/ and output/")
+    """Startup routine: enforce 4GB LRU cache limit and clean temporary segmentation buffers."""
+    try:
+        freed = await lru_manager.evict_if_needed(0, db=db)
+        temp_cleaned = lru_manager.cleanup_temp_inputs(max_age_hours=1.0)
+        current_mb = lru_manager.get_current_cache_size() / (1024 * 1024)
+        logger.info(
+            f"[startup] LRU Cache ready: {current_mb:.1f} MB in use (Quota: {lru_manager.max_mb:.0f} MB). "
+            f"Pruned: {freed / (1024 * 1024):.1f} MB, cleaned {temp_cleaned} temp files."
+        )
+    except Exception as e:
+        logger.error(f"[startup] LRU startup prune error: {e}")
 
 @app.on_event("shutdown")
 async def shutdown_db():
     db_client.close()
     if blender_client.is_connected:
         await blender_client.disconnect()
-    # Delete all GLBs from input/ and output/ on session end
-    for folder in [INPUT_DIR, OUTPUT_DIR]:
-        if folder.exists():
-            for f in folder.glob("*.glb"):
-                f.unlink(missing_ok=True)
-    logger.info("[shutdown] Cleared GLB files from input/ and output/")
+    logger.info("[shutdown] Database connection closed. Model cache preserved.")
