@@ -197,12 +197,15 @@ class BlenderMCPClient:
                 "API_KEY not set. Set it in .env file."
             )
 
-        self._client = AsyncOpenAI(
-            api_key=api_key, 
-            base_url=base_url,
-            timeout=120.0,  # 2 minutes timeout
-            max_retries=2
-        )
+        if not api_key:
+            self._client = None
+        else:
+            self._client = AsyncOpenAI(
+                api_key=api_key, 
+                base_url=base_url,
+                timeout=120.0,  # 2 minutes timeout
+                max_retries=2
+            )
         self._session: Optional[ClientSession] = None
         self._exit_stack = AsyncExitStack()
         self._tools: list[dict] = []

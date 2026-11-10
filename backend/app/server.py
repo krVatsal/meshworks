@@ -47,8 +47,10 @@ from app.conversation_service import (
     _select_model_result,
 )
 
-ROOT_DIR = Path(__file__).parent.parent.parent.parent  # Sankalp/
+ROOT_DIR = Path(__file__).resolve().parents[2]  # repo root
 load_dotenv(ROOT_DIR / '.env')
+load_dotenv(Path(__file__).resolve().parent.parent / '.env')
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

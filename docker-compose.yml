@@ -1,0 +1,59 @@
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo:7.0
+    container_name: meshworks-mongodb
+    restart: always
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - meshworks-network
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: meshworks-backend
+    restart: always
+    env_file:
+      - .env
+    environment:
+      - MONGO_URL=mongodb://mongodb:27017
+      - DB_NAME=prompt2mesh
+      - CORS_ORIGINS=*
+    ports:
+      - "8000:8000"
+    depends_on:
+      - mongodb
+    volumes:
+      - backend_output:/app/app/output
+    networks:
+      - meshworks-network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_BACKEND_URL: http://localhost:8000
+    container_name: meshworks-frontend
+    restart: always
+    environment:
+      - NEXT_PUBLIC_BACKEND_URL=http://localhost:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    networks:
+      - meshworks-network
+
+volumes:
+  mongo_data:
+  backend_output:
+
+networks:
+  meshworks-network:
+    driver: bridge
