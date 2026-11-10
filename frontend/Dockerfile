@@ -2,14 +2,17 @@ FROM node:20-alpine AS deps
 
 WORKDIR /app
 
-COPY package.json pnpm-lock.yaml ./
+RUN npm install -g pnpm@10.29.1
 
-RUN corepack enable \
-    && pnpm install --frozen-lockfile
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml* .npmrc* ./
+
+RUN pnpm install --frozen-lockfile
 
 FROM node:20-alpine AS builder
 
 WORKDIR /app
+
+RUN npm install -g pnpm@10.29.1
 
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
@@ -18,8 +21,7 @@ ARG NEXT_PUBLIC_BACKEND_URL
 ENV NEXT_PUBLIC_BACKEND_URL=$NEXT_PUBLIC_BACKEND_URL
 ENV NEXT_TELEMETRY_DISABLED=1
 
-RUN corepack enable \
-    && pnpm build
+RUN pnpm build
 
 FROM node:20-alpine AS runner
 

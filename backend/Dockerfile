@@ -18,21 +18,14 @@ RUN apt-get update \
 COPY pyproject.toml /app/pyproject.toml
 
 RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu \
     && python - <<'PY'
 import subprocess
 from pathlib import Path
-
-try:
-    import tomllib
-except Exception as exc:
-    raise SystemExit(f"tomllib not available: {exc}")
+import tomllib
 
 data = tomllib.loads(Path("pyproject.toml").read_text())
-
-deps = data.get("project", {}).get("dependencies", [])
-if not deps:
-    raise SystemExit("No dependencies found in pyproject.toml")
-
+deps = [d for d in data.get("project", {}).get("dependencies", []) if not d.startswith("torch")]
 subprocess.check_call(["pip", "install", "--no-cache-dir", *deps])
 PY
 
