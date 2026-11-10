@@ -56,14 +56,25 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-mongo_url = os.environ['MONGO_URL']
-db_client = AsyncIOMotorClient(mongo_url)
-db = db_client[os.environ['DB_NAME']]
-fs = AsyncIOMotorGridFSBucket(db)
-ENABLE_GRIDFS_CACHE = os.environ.get("ENABLE_GRIDFS_CACHE", "").strip().lower() in {"1", "true", "yes", "on"}
+mongo_url = os.environ.get('MONGO_URL', '')
+db_name = os.environ.get('DB_NAME', 'model_discovery_db')
+db_client: Optional[AsyncIOMotorClient] = None
+db: Any = None
+fs: Any = None
 
-groq_client = Groq(api_key=os.environ['GROQ_API_KEY'])
-tavily_client = TavilyClient(api_key=os.environ['TAVILY_API_KEY'])
+def init_db():
+    global db_client, db, fs
+    if db_client is None:
+        db_client = AsyncIOMotorClient(mongo_url)
+        db = db_client[db_name]
+        fs = AsyncIOMotorGridFSBucket(db)
+    return db
+
+# Initialize immediately for any early attribute access
+init_db()
+
+groq_client = Groq(api_key=os.environ.get('GROQ_API_KEY', ''))
+tavily_client = TavilyClient(api_key=os.environ.get('TAVILY_API_KEY', ''))
 
 app = FastAPI(title="3D Model Discovery API")
 api_router = APIRouter(prefix="/api")
@@ -1554,15 +1565,22 @@ async def search_models(request: SearchRequest, background_tasks: BackgroundTask
 
 @api_router.get("/history", response_model=List[SearchResponse])
 async def get_history(limit: int = Query(default=20, le=50)):
-    # Sort by LRU (last_accessed_at descending), then created_at descending
-    records = await (
-        db.searches
-        .find({"status": {"$in": ["completed", "no_model"]}}, {"_id": 0})
-        .sort([("last_accessed_at", -1), ("created_at", -1)])
-        .limit(limit)
-        .to_list(limit)
-    )
-    return [record_to_response(r) for r in records]
+    try:
+        # Sort by LRU (last_accessed_at descending), then created_at descending
+        records = await (
+            db.searches
+            .find({"status": {"$in": ["completed", "no_model"]}}, {"_id": 0})
+            .sort([("last_accessed_at", -1), ("created_at", -1)])
+            .limit(limit)
+            .to_list(limit)
+        )
+        return [record_to_response(r) for r in records]
+    except Exception as e:
+        logger.error(f"[get_history] Database error: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Database unavailable or authentication failed: {str(e)}"
+        )
 
 
 @api_router.get("/history/{search_id}", response_model=SearchResponse)
@@ -2235,7 +2253,20 @@ app.include_router(api_router)
 
 @app.on_event("startup")
 async def startup_cleanup():
-    """Startup routine: enforce 4GB LRU cache limit and clean temporary segmentation buffers."""
+    """Startup routine: bind Motor to active event loop, test DB connection, enforce 4GB LRU cache limit."""
+    global db_client, db, fs
+    try:
+        # Reconnect Motor within Uvicorn's active event loop to prevent "attached to a different loop" errors
+        db_client = AsyncIOMotorClient(mongo_url)
+        db = db_client[db_name]
+        fs = AsyncIOMotorGridFSBucket(db)
+        
+        # Test connection
+        await db.command("ping")
+        logger.info("[startup] MongoDB connection successful.")
+    except Exception as e:
+        logger.error(f"[startup] MongoDB connection failed: {e}")
+
     try:
         freed = await lru_manager.evict_if_needed(0, db=db)
         temp_cleaned = lru_manager.cleanup_temp_inputs(max_age_hours=1.0)
