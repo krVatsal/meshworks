@@ -1,6 +1,9 @@
 services:
   backend:
     image: krvatsal/meshworks-backend:latest
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
     container_name: meshworks-backend
     restart: always
     env_file:
@@ -12,6 +15,9 @@ services:
 
   frontend:
     image: krvatsal/meshworks-frontend:latest
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
     container_name: meshworks-frontend
     restart: always
     environment:
