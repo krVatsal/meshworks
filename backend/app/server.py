@@ -1148,6 +1148,10 @@ async def _evaluate_single_candidate(
             f"is_scorable: {fetch_result.is_scorable}, local_path: {fetch_result.local_path}"
         )
 
+        if not fetch_result.local_path or not fetch_result.is_scorable:
+            logger.info(f"[{idx}/{total}] Candidate is not downloadable / no local path. Skipping mesh scoring.")
+            return None, None, None
+
         # Save original before any segmentation/renaming
         original_src = Path(fetch_result.local_path)
         original_dst = OUTPUT_DIR / (original_src.stem + "_original.glb")

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import math
 import os
 import re
@@ -7,15 +8,21 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from openai import OpenAI
 
+logger = logging.getLogger(__name__)
+
 GLM_BASE_URL = os.environ.get("GLM_BASE_URL", "").strip()
 API_KEY = os.environ.get("API_KEY", "").strip()
 GLM_MODEL = os.environ.get("GLM_MODEL", "gpt-5-mini").strip()
 
 
-def _create_client() -> OpenAI:
+def _create_client() -> Optional[OpenAI]:
     if not GLM_BASE_URL or not API_KEY:
-        raise RuntimeError("GLM_BASE_URL/API_KEY not configured in backend .env")
-    return OpenAI(base_url=GLM_BASE_URL, api_key=API_KEY)
+        return None
+    try:
+        return OpenAI(base_url=GLM_BASE_URL, api_key=API_KEY)
+    except Exception as e:
+        logger.warning(f"[mesh_renamer] Failed to create OpenAI client: {e}")
+        return None
 
 
 def parse_glb(data: bytes) -> Dict[str, Any]:
@@ -900,12 +907,17 @@ async def rename_meshes(
         )
 
         max_tokens = min(3500, max(900, len(chunk) * 18))
-        content, finish_reason, had_reasoning_only = await _chat_json(
-            client=client,
-            model=GLM_MODEL,
-            prompt=prompt,
-            max_tokens=max_tokens,
-        )
+        content, finish_reason, had_reasoning_only = "", None, False
+        if client:
+            try:
+                content, finish_reason, had_reasoning_only = await _chat_json(
+                    client=client,
+                    model=GLM_MODEL,
+                    prompt=prompt,
+                    max_tokens=max_tokens,
+                )
+            except Exception as e:
+                logger.warning(f"[mesh_renamer] AI chat failed: {e}; falling back to cues")
 
         parsed = _try_parse_object(content)
         parsed_chunk: Dict[str, str] = {}
