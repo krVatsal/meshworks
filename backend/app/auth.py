@@ -104,14 +104,22 @@ def decode_access_token(token: str) -> Dict[str, Any]:
 
 def verify_google_id_token(token_str: str) -> Dict[str, Any]:
     """Verify Google ID token and return claims dict."""
+    client_id = (
+        os.environ.get("GOOGLE_CLIENT_ID", "").strip()
+        or os.environ.get("NEXT_PUBLIC_GOOGLE_CLIENT_ID", "").strip()
+        or GOOGLE_CLIENT_ID
+    )
+    audience = client_id if client_id else None
+
+    # 1. Primary: Verify locally with google-auth library (with 120s clock skew tolerance)
     try:
         request = google_requests.Request()
-        # If GOOGLE_CLIENT_ID is configured, verify audience. Otherwise verify token signature.
-        audience = GOOGLE_CLIENT_ID if GOOGLE_CLIENT_ID else None
-        id_info = google_id_token.verify_oauth2_token(token_str, request, audience=audience)
+        id_info = google_id_token.verify_oauth2_token(
+            token_str, request, audience=audience, clock_skew_in_seconds=120
+        )
 
         if id_info.get("iss") not in ["accounts.google.com", "https://accounts.google.com"]:
-            raise ValueError("Wrong issuer in Google ID token.")
+            raise ValueError(f"Wrong issuer: {id_info.get('iss')}")
 
         return {
             "google_id": id_info.get("sub"),
@@ -119,11 +127,35 @@ def verify_google_id_token(token_str: str) -> Dict[str, Any]:
             "name": id_info.get("name") or id_info.get("email", "").split("@")[0],
             "picture": id_info.get("picture"),
         }
-    except Exception as e:
-        logger.error(f"[auth] Google token verification failed: {e}")
+    except Exception as e1:
+        logger.warning(f"[auth] Local google-auth verification failed ({e1}), checking tokeninfo fallback...")
+
+    # 2. Secondary: Fallback to Google's official tokeninfo API
+    try:
+        import httpx
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.get("https://oauth2.googleapis.com/tokeninfo", params={"id_token": token_str})
+            if resp.status_code == 200:
+                id_info = resp.json()
+                if audience and id_info.get("aud") != audience:
+                    raise ValueError(f"Audience mismatch: token aud '{id_info.get('aud')}' != expected '{audience}'")
+                if id_info.get("iss") not in ["accounts.google.com", "https://accounts.google.com"]:
+                    raise ValueError(f"Wrong issuer: {id_info.get('iss')}")
+
+                return {
+                    "google_id": id_info.get("sub"),
+                    "email": id_info.get("email"),
+                    "name": id_info.get("name") or id_info.get("email", "").split("@")[0],
+                    "picture": id_info.get("picture"),
+                }
+            else:
+                logger.error(f"[auth] Google tokeninfo API failed: {resp.text}")
+                raise ValueError(f"Google tokeninfo response: {resp.text}")
+    except Exception as e2:
+        logger.error(f"[auth] Google token verification failed: {e2}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Google authentication failed: {str(e)}",
+            detail=f"Google authentication failed: {str(e2)}",
         )
 
 

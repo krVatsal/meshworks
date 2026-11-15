@@ -109,7 +109,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setLoginModalOpen(false);
     } catch (err: any) {
       console.error("[Auth] Google sign-in failed:", err);
-      alert("Sign-in failed. Please ensure Google OAuth credentials are valid.");
+      const detail = err?.response?.data?.detail;
+      const msg = typeof detail === "string" ? detail : detail?.message || err?.message || "Invalid Google credentials or network error.";
+      alert(`Sign-in failed: ${msg}`);
     } finally {
       setIsLoading(false);
     }
