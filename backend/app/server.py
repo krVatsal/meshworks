@@ -48,6 +48,7 @@ from app.conversation_service import (
     _select_model_result,
 )
 from app.auth import (
+    GOOGLE_CLIENT_ID,
     GoogleAuthRequest,
     UserResponse,
     UserSubscription,
@@ -1802,6 +1803,14 @@ async def get_cache_stats():
 
 
 # ─── Authentication & Quota Endpoints ─────────────────────────────────────────
+
+@api_router.get("/auth/config")
+async def get_auth_config():
+    """Return public authentication configuration (Google OAuth Client ID)."""
+    client_id = GOOGLE_CLIENT_ID or os.environ.get("NEXT_PUBLIC_GOOGLE_CLIENT_ID", "")
+    return {
+        "google_client_id": client_id.strip(),
+    }
 
 @api_router.post("/auth/google", response_model=AuthTokenResponse)
 async def google_auth_endpoint(auth_req: GoogleAuthRequest):

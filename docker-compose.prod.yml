@@ -18,10 +18,15 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      args:
+        - NEXT_PUBLIC_GOOGLE_CLIENT_ID=${NEXT_PUBLIC_GOOGLE_CLIENT_ID}
     container_name: meshworks-frontend
     restart: always
+    env_file:
+      - .env
     environment:
       - BACKEND_URL=http://backend:8000
+      - NEXT_PUBLIC_GOOGLE_CLIENT_ID=${NEXT_PUBLIC_GOOGLE_CLIENT_ID}
     ports:
       - "3000:3000"
     depends_on:

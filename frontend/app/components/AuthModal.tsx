@@ -1,6 +1,7 @@
 "use client";
 
-import React, { useEffect, useRef } from "react";
+import React, { useEffect, useRef, useState } from "react";
+import axios from "axios";
 import { useAuth } from "../context/AuthContext";
 import { X, Sparkles, Shield, AlertTriangle, ArrowRight } from "lucide-react";
 import Link from "next/link";
@@ -23,7 +24,25 @@ export default function AuthModal() {
   } = useAuth();
 
   const googleBtnRef = useRef<HTMLDivElement>(null);
-  const clientId = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID || "";
+  const [clientId, setClientId] = useState<string>(
+    process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID || ""
+  );
+
+  // Fetch client ID dynamically from backend if not baked into env
+  useEffect(() => {
+    if (!clientId) {
+      axios
+        .get<{ google_client_id: string }>("/api/auth/config")
+        .then((res) => {
+          if (res.data?.google_client_id) {
+            setClientId(res.data.google_client_id);
+          }
+        })
+        .catch((err) => {
+          console.warn("[Auth] Could not fetch auth config:", err);
+        });
+    }
+  }, [clientId]);
 
   // Load and initialize Google Identity Services
   useEffect(() => {
