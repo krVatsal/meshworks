@@ -21,17 +21,33 @@ RAZORPAY_WEBHOOK_SECRET = os.environ.get("RAZORPAY_WEBHOOK_SECRET", "").strip()
 
 
 def get_razorpay_key_id() -> str:
-    """Dynamically get the Razorpay Key ID from env or module default."""
-    return (
-        os.environ.get("RAZORPAY_KEY_ID", "").strip()
-        or os.environ.get("NEXT_PUBLIC_RAZORPAY_KEY_ID", "").strip()
-        or RAZORPAY_KEY_ID
-    )
+    """Dynamically get the Razorpay Key ID from env, checking multiple naming conventions."""
+    for var in [
+        "RAZORPAY_KEY_ID",
+        "NEXT_PUBLIC_RAZORPAY_KEY_ID",
+        "RAZORPAY_KEY",
+        "RAZOR_PAY_KEY_ID",
+        "razorpay_key_id",
+    ]:
+        val = os.environ.get(var, "").strip()
+        if val:
+            return val
+    return RAZORPAY_KEY_ID
 
 
 def get_razorpay_key_secret() -> str:
-    """Dynamically get the Razorpay Key Secret from env or module default."""
-    return os.environ.get("RAZORPAY_KEY_SECRET", "").strip() or RAZORPAY_KEY_SECRET
+    """Dynamically get the Razorpay Key Secret from env, checking multiple naming conventions."""
+    for var in [
+        "RAZORPAY_KEY_SECRET",
+        "RAZORPAY_SECRET",
+        "RAZOR_PAY_KEY_SECRET",
+        "RAZOR_PAY_SECRET",
+        "razorpay_key_secret",
+    ]:
+        val = os.environ.get(var, "").strip()
+        if val:
+            return val
+    return RAZORPAY_KEY_SECRET
 
 PLANS: Dict[str, Dict[str, Any]] = {
     "free": {
@@ -89,9 +105,15 @@ def _get_razorpay_client() -> razorpay.Client:
     key_id = get_razorpay_key_id()
     key_secret = get_razorpay_key_secret()
     if not key_id or not key_secret:
+        razor_vars = {k: v[:6] + "..." if v else "" for k, v in os.environ.items() if "RAZOR" in k.upper()}
+        logger.warning(f"[payment] Razorpay check failed. Found vars: {razor_vars}")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Razorpay payment gateway credentials not configured on server (RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET).",
+            detail=(
+                f"Razorpay credentials not loaded into container environment: "
+                f"RAZORPAY_KEY_ID={'SET' if key_id else 'MISSING'}, "
+                f"RAZORPAY_KEY_SECRET={'SET' if key_secret else 'MISSING'}."
+            ),
         )
     return razorpay.Client(auth=(key_id, key_secret))
 
