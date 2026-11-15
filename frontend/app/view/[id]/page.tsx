@@ -19,6 +19,7 @@ import {
   Check,
   MessageSquare,
   Download,
+  Glasses,
 } from "lucide-react";
 
 const API = `${process.env.NEXT_PUBLIC_BACKEND_URL}/api`;
@@ -265,6 +266,15 @@ export default function ViewerPage() {
             ) : (
               "▶ STORY MODE"
             )}
+          </button>
+
+          {/* VR Holodeck Button (Detachable Feature) */}
+          <button
+            onClick={() => router.push(`/vr/${id}`)}
+            className="mt-2 w-full flex items-center justify-center gap-2 py-2 border border-cyber/50 bg-cyber/10 hover:bg-cyber/20 text-cyber font-mono text-[10px] tracking-widest transition-all duration-200 shadow-[0_0_15px_rgba(0,240,255,0.15)] group"
+          >
+            <Glasses size={12} className="group-hover:scale-110 transition-transform" />
+            ENTER VR HOLODECK
           </button>
 
         </div>

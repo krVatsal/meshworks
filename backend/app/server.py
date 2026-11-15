@@ -2411,6 +2411,14 @@ async def blender_clear_conversation(conversation_id: str):
     return {"status": "cleared", "conversation_id": conversation_id}
 
 
+# ─── VR Subsystem (Detachable) ────────────────────────────────────────────────
+try:
+    from app.vr_service import vr_router
+    api_router.include_router(vr_router)
+    logger.info("[vr] VR Holodeck service mounted at /api/vr")
+except Exception as e:
+    logger.warning(f"[vr] VR service failed to mount: {e}")
+
 app.include_router(api_router)
 
 

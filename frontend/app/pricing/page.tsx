@@ -32,6 +32,7 @@ const PLANS: PlanItem[] = [
     description: "Ideal for hobbyists exploring AI-powered 3D asset generation.",
     features: [
       "10 model searches & generations / month",
+      "1 Free VR Holodeck session / month (10 min session)",
       "Standard 3D WebGL viewer & inspection",
       "Direct GLB export download",
       "Community model archive access",
@@ -46,6 +47,7 @@ const PLANS: PlanItem[] = [
     description: "For individual 3D designers, game devs, and digital artists.",
     features: [
       "250 model generations / month",
+      "25 VR Holodeck sessions / month (45 min session)",
       "Multi-part mesh segmentation & semantic renaming",
       "Interactive 3D narrative & part inspection",
       "Priority web discovery & fallback mesh generator",
@@ -63,6 +65,7 @@ const PLANS: PlanItem[] = [
     description: "Maximum efficiency and cost savings for serious creators.",
     features: [
       "3,000 model generations / year",
+      "300 VR Holodeck sessions / year (Unlimited session duration)",
       "Everything in Pro Monthly",
       "Full 4GB persistent LRU model cache",
       "Early access to new AI & segmentation models",
@@ -79,6 +82,7 @@ const PLANS: PlanItem[] = [
     description: "Deploy campus-wide or across research laboratories.",
     features: [
       "10,000 pooled generations / year",
+      "1,000 Pooled VR Holodeck classroom sessions / year",
       "Up to 50 active student/staff seats",
       "Email domain auto-onboarding (e.g. @university.edu)",
       "Centralized usage monitoring & analytics",
@@ -96,6 +100,7 @@ const PLANS: PlanItem[] = [
     description: "Multi-year institution contract with dedicated compute & support.",
     features: [
       "25,000 pooled generations across 2 years",
+      "3,000 Pooled VR Holodeck classroom sessions / 2 years",
       "Up to 100 active student/staff seats",
       "Custom domain auto-join & role access control",
       "Dedicated API rate limits & batch processing",
