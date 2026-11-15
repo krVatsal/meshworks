@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import Link from "next/link";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import NavBar from "./components/NavBar";
@@ -40,6 +41,24 @@ export default function RootLayout({
           <div className="grain cyber-grid min-h-screen flex flex-col">
             <NavBar />
             <main className="flex-1">{children}</main>
+            <footer className="border-t border-white/5 py-4 px-6 text-center text-xs font-mono text-slate-500">
+              <div className="max-w-7xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-3">
+                <div>© 2026 MeshWorks • AI 3D Platform</div>
+                <div className="flex items-center gap-4">
+                  <Link href="/privacy" className="hover:text-cyber transition-colors">
+                    Privacy Policy
+                  </Link>
+                  <span className="text-white/10">•</span>
+                  <Link href="/terms" className="hover:text-cyber transition-colors">
+                    Terms of Service
+                  </Link>
+                  <span className="text-white/10">•</span>
+                  <Link href="/pricing" className="hover:text-cyber transition-colors">
+                    Plans
+                  </Link>
+                </div>
+              </div>
+            </footer>
             <AuthModal />
           </div>
         </AuthProvider>

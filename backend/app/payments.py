@@ -39,6 +39,7 @@ def get_razorpay_key_secret() -> str:
     """Dynamically get the Razorpay Key Secret from env, checking multiple naming conventions."""
     for var in [
         "RAZORPAY_KEY_SECRET",
+        "RAZORPAY_KEY_SECRE",
         "RAZORPAY_SECRET",
         "RAZOR_PAY_KEY_SECRET",
         "RAZOR_PAY_SECRET",

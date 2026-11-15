@@ -192,8 +192,23 @@ export default function AuthModal() {
               </p>
             )}
 
-            <p className="text-[10px] font-mono text-slate-500">
-              By signing in, you agree to Meshworks terms of service and usage quotas.
+            <p className="text-[10px] font-mono text-slate-500 leading-relaxed">
+              By signing in, you agree to MeshWorks&apos;{" "}
+              <Link
+                href="/terms"
+                onClick={() => setLoginModalOpen(false)}
+                className="text-cyber hover:underline"
+              >
+                Terms of Service
+              </Link>{" "}
+              and{" "}
+              <Link
+                href="/privacy"
+                onClick={() => setLoginModalOpen(false)}
+                className="text-cyber hover:underline"
+              >
+                Privacy Policy
+              </Link>.
             </p>
           </div>
         )}
