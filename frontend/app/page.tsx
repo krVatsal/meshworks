@@ -13,6 +13,7 @@ import {
   Layers,
   Image as ImageIcon,
 } from "lucide-react";
+import { useAuth } from "./context/AuthContext";
 
 const API = `${process.env.NEXT_PUBLIC_BACKEND_URL}/api`;
 
@@ -57,6 +58,14 @@ export default function SearchPage() {
   const [imagePreview, setImagePreview] = useState<string | null>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
 
+  const {
+    user,
+    isQuotaExceeded,
+    setLoginModalOpen,
+    setQuotaModalOpen,
+    refreshUser,
+  } = useAuth();
+
   useEffect(() => {
     let cancelled = false;
     axios
@@ -80,13 +89,21 @@ export default function SearchPage() {
     return () => clearInterval(interval);
   }, [loading]);
 
-
-
   const handleSearch = async (e?: React.FormEvent) => {
     e?.preventDefault();
     if (imageFile) { handleImageSearch(); return; }
     const q = prompt.trim();
     if (!q || loading) return;
+
+    // Check Authentication & Quota
+    if (!user) {
+      setLoginModalOpen(true);
+      return;
+    }
+    if (isQuotaExceeded) {
+      setQuotaModalOpen(true);
+      return;
+    }
 
     setLoading(true);
     setLoadingStep(0);
@@ -94,14 +111,25 @@ export default function SearchPage() {
 
     try {
       const res = await axios.post(`${API}/search`, { prompt: q });
+      await refreshUser();
       router.push(`/view/${res.data.id}`);
     } catch (err: unknown) {
-      const msg =
-        axios.isAxiosError(err)
-          ? err.response?.data?.detail || "Search failed. Please try again."
-          : "Search failed. Please try again.";
-      setError(msg);
       setLoading(false);
+      if (axios.isAxiosError(err)) {
+        if (err.response?.status === 401) {
+          setLoginModalOpen(true);
+          return;
+        }
+        if (err.response?.status === 403 && (err.response?.data?.detail?.code === "QUOTA_EXCEEDED" || err.response?.data?.code === "QUOTA_EXCEEDED")) {
+          setQuotaModalOpen(true);
+          return;
+        }
+        const detail = err.response?.data?.detail;
+        const msg = typeof detail === "string" ? detail : detail?.message || "Search failed. Please try again.";
+        setError(msg);
+      } else {
+        setError("Search failed. Please try again.");
+      }
     }
   };
 
@@ -120,6 +148,17 @@ export default function SearchPage() {
 
   const handleImageSearch = async () => {
     if (!imageFile || loading) return;
+
+    // Check Authentication & Quota
+    if (!user) {
+      setLoginModalOpen(true);
+      return;
+    }
+    if (isQuotaExceeded) {
+      setQuotaModalOpen(true);
+      return;
+    }
+
     setLoading(true);
     setLoadingStep(0);
     setError(null);
@@ -129,13 +168,25 @@ export default function SearchPage() {
       const res = await axios.post(`${API}/search/image`, formData, {
         headers: { "Content-Type": "multipart/form-data" },
       });
+      await refreshUser();
       router.push(`/view/${res.data.id}`);
     } catch (err: unknown) {
-      const msg = axios.isAxiosError(err)
-        ? err.response?.data?.detail || "Image search failed."
-        : "Image search failed.";
-      setError(msg);
       setLoading(false);
+      if (axios.isAxiosError(err)) {
+        if (err.response?.status === 401) {
+          setLoginModalOpen(true);
+          return;
+        }
+        if (err.response?.status === 403 && (err.response?.data?.detail?.code === "QUOTA_EXCEEDED" || err.response?.data?.code === "QUOTA_EXCEEDED")) {
+          setQuotaModalOpen(true);
+          return;
+        }
+        const detail = err.response?.data?.detail;
+        const msg = typeof detail === "string" ? detail : detail?.message || "Image search failed.";
+        setError(msg);
+      } else {
+        setError("Image search failed.");
+      }
     }
   };
 

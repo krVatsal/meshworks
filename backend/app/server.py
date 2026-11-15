@@ -47,6 +47,28 @@ from app.conversation_service import (
     handle_model_chat,
     _select_model_result,
 )
+from app.auth import (
+    GoogleAuthRequest,
+    UserResponse,
+    UserSubscription,
+    UserUsage,
+    AuthTokenResponse,
+    verify_google_id_token,
+    get_or_create_user,
+    create_access_token,
+    check_and_consume_quota,
+    get_current_user_from_request,
+    get_optional_current_user_from_request,
+)
+from app.payments import (
+    PLANS,
+    CreateOrderRequest,
+    CreateOrderResponse,
+    VerifyPaymentRequest,
+    VerifyPaymentResponse,
+    create_payment_order,
+    verify_and_activate_payment,
+)
 
 ROOT_DIR = Path(__file__).resolve().parents[2]  # repo root
 load_dotenv(ROOT_DIR / '.env')
@@ -74,6 +96,7 @@ def init_db():
 init_db()
 
 ENABLE_GRIDFS_CACHE = os.environ.get("ENABLE_GRIDFS_CACHE", "").strip().lower() in {"1", "true", "yes", "on"}
+REQUIRE_AUTH = os.environ.get("REQUIRE_AUTH", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 groq_client = Groq(api_key=os.environ.get('GROQ_API_KEY', ''))
 tavily_client = TavilyClient(api_key=os.environ.get('TAVILY_API_KEY', ''))
@@ -1344,6 +1367,19 @@ async def search_models(request: SearchRequest, background_tasks: BackgroundTask
     if not prompt:
         raise HTTPException(status_code=400, detail="Prompt cannot be empty")
 
+    # ─── Auth & Quota Check (10 Free/Month) ──────────────────────────────────
+    user = await get_optional_current_user_from_request(http_request)
+    if user:
+        await check_and_consume_quota(db, user["id"])
+    elif REQUIRE_AUTH:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "code": "AUTH_REQUIRED",
+                "message": "Please sign in with Google to use your 10 free generations per month.",
+            },
+        )
+
     attributes = await refine_prompt_with_groq(prompt)
 
     # DB-first reuse: exact prompt/refined-query match first, then semantic reuse.
@@ -1369,6 +1405,8 @@ async def search_models(request: SearchRequest, background_tasks: BackgroundTask
     record = SearchRecord(original_prompt=prompt, attributes=attributes)
     doc = record.model_dump()
     doc["created_at"] = doc["created_at"].isoformat()
+    if user:
+        doc["user_id"] = user["id"]
     await db.searches.insert_one(doc)
 
     # ─── TEST MODEL SHORTCUT ──────────────────────────────────────────────────
@@ -1762,6 +1800,79 @@ async def get_cache_stats():
         "cached_models": len([f for f in OUTPUT_DIR.glob("*.glb") if f.is_file()])
     }
 
+
+# ─── Authentication & Quota Endpoints ─────────────────────────────────────────
+
+@api_router.post("/auth/google", response_model=AuthTokenResponse)
+async def google_auth_endpoint(auth_req: GoogleAuthRequest):
+    """Authenticate or register user with Google OAuth ID token."""
+    google_info = verify_google_id_token(auth_req.id_token)
+    user = await get_or_create_user(db, google_info)
+    access_token = create_access_token(user["id"], user["email"])
+    
+    return AuthTokenResponse(
+        access_token=access_token,
+        token_type="bearer",
+        user=UserResponse(
+            id=user["id"],
+            email=user["email"],
+            name=user.get("name", ""),
+            picture=user.get("picture"),
+            role=user.get("role", "user"),
+            institution_id=user.get("institution_id"),
+            subscription=UserSubscription(**user.get("subscription", {})),
+            usage=UserUsage(**user.get("usage", {})),
+            created_at=user.get("created_at", ""),
+            last_login_at=user.get("last_login_at", ""),
+        )
+    )
+
+@api_router.get("/auth/me", response_model=UserResponse)
+async def get_my_profile(current_user: Dict[str, Any] = Depends(get_current_user_from_request)):
+    """Return the profile, subscription status, and remaining quota for current user."""
+    refreshed_user = await get_or_create_user(db, {
+        "email": current_user["email"],
+        "name": current_user.get("name"),
+        "picture": current_user.get("picture"),
+        "google_id": current_user.get("google_id"),
+    })
+    return UserResponse(
+        id=refreshed_user["id"],
+        email=refreshed_user["email"],
+        name=refreshed_user.get("name", ""),
+        picture=refreshed_user.get("picture"),
+        role=refreshed_user.get("role", "user"),
+        institution_id=refreshed_user.get("institution_id"),
+        subscription=UserSubscription(**refreshed_user.get("subscription", {})),
+        usage=UserUsage(**refreshed_user.get("usage", {})),
+        created_at=refreshed_user.get("created_at", ""),
+        last_login_at=refreshed_user.get("last_login_at", ""),
+    )
+
+
+# ─── Razorpay Payment & Subscription Endpoints ────────────────────────────────
+
+@api_router.get("/payments/plans")
+async def get_plans_endpoint():
+    """Return all available subscription and institutional plans."""
+    return {"plans": PLANS}
+
+@api_router.post("/payments/create-order", response_model=CreateOrderResponse)
+async def create_order_endpoint(
+    req: CreateOrderRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user_from_request),
+):
+    """Create a new Razorpay payment order for the chosen plan."""
+    return await create_payment_order(req.plan_id, current_user)
+
+@api_router.post("/payments/verify", response_model=VerifyPaymentResponse)
+async def verify_payment_endpoint(
+    req: VerifyPaymentRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user_from_request),
+):
+    """Verify Razorpay payment signature and activate plan with upgraded quota."""
+    return await verify_and_activate_payment(db, req, current_user)
+
 #image search 
 
 @api_router.post("/search/image", response_model=SearchResponse)
@@ -1775,6 +1886,19 @@ async def search_from_image(
     """
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Only image files are supported")
+
+    # ─── Auth & Quota Check (10 Free/Month) ──────────────────────────────────
+    user = await get_optional_current_user_from_request(http_request) if http_request else None
+    if user:
+        await check_and_consume_quota(db, user["id"])
+    elif REQUIRE_AUTH:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "code": "AUTH_REQUIRED",
+                "message": "Please sign in with Google to use your 10 free generations per month.",
+            },
+        )
 
     image_bytes = await file.read()
     if len(image_bytes) < 1000:

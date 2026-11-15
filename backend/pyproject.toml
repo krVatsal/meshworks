@@ -13,6 +13,12 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "groq>=0.9.0",
     "tavily-python>=0.3.0",
+    # Auth & Security
+    "google-auth>=2.29.0",
+    "pyjwt>=2.8.0",
+    "cryptography>=42.0.0",
+    # Payments
+    "razorpay>=1.4.1",
     # Blender MCP + Zhipu AI GLM (uses OpenAI-compatible client)
     "openai>=1.0.0",
     "mcp[cli]>=1.0.0",
