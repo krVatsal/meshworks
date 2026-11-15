@@ -19,6 +19,7 @@ export default function AuthModal() {
     quotaModalOpen,
     setQuotaModalOpen,
     handleGoogleCredential,
+    isMaster,
   } = useAuth();
 
   const googleBtnRef = useRef<HTMLDivElement>(null);
@@ -68,9 +69,9 @@ export default function AuthModal() {
     }
   }, [loginModalOpen, quotaModalOpen, clientId, handleGoogleCredential]);
 
-  if (!loginModalOpen && !quotaModalOpen) return null;
+  if (!loginModalOpen && (!quotaModalOpen || isMaster)) return null;
 
-  const isQuotaView = quotaModalOpen;
+  const isQuotaView = quotaModalOpen && !isMaster;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fade-in">

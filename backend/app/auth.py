@@ -21,6 +21,20 @@ JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_DAYS = 30
 FREE_GENERATIONS_PER_MONTH = 10
 
+# Master emails with zero restrictions and unlimited access
+MASTER_EMAILS = [
+    e.strip().lower()
+    for e in os.environ.get("MASTER_EMAILS", "prompt2mesh@gmail.com").split(",")
+    if e.strip()
+]
+
+
+def is_master_email(email: Optional[str]) -> bool:
+    """Check if an email is registered as an unrestricted master account."""
+    if not email:
+        return False
+    return email.lower().strip() in MASTER_EMAILS
+
 
 # ─── Pydantic Schemas ─────────────────────────────────────────────────────────
 
@@ -120,6 +134,7 @@ async def get_or_create_user(db, google_info: Dict[str, Any]) -> Dict[str, Any]:
     email = google_info["email"].lower().strip()
     now = datetime.now(timezone.utc)
     now_iso = now.isoformat()
+    is_master = is_master_email(email)
 
     user = await db.users.find_one({"email": email})
 
@@ -144,7 +159,14 @@ async def get_or_create_user(db, google_info: Dict[str, Any]) -> Dict[str, Any]:
             "last_login_at": now_iso,
         }
 
-        if needs_rollover:
+        # If master email, ensure master privileges are active with infinite limits
+        if is_master:
+            update_fields["role"] = "master"
+            update_fields["subscription.plan_id"] = "master"
+            update_fields["subscription.status"] = "active"
+            update_fields["usage.generations_limit"] = 999999999
+
+        if needs_rollover and not is_master:
             rollover_end = (now + timedelta(days=30)).isoformat()
             update_fields["usage.current_period_start"] = now_iso
             update_fields["usage.current_period_end"] = rollover_end
@@ -157,7 +179,7 @@ async def get_or_create_user(db, google_info: Dict[str, Any]) -> Dict[str, Any]:
 
     # Create new user
     user_id = f"usr_{uuid.uuid4().hex[:12]}"
-    period_end_iso = (now + timedelta(days=30)).isoformat()
+    period_end_iso = (now + timedelta(days=36500)).isoformat() if is_master else (now + timedelta(days=30)).isoformat()
 
     new_user = {
         "id": user_id,
@@ -165,12 +187,12 @@ async def get_or_create_user(db, google_info: Dict[str, Any]) -> Dict[str, Any]:
         "email": email,
         "name": google_info.get("name") or email.split("@")[0],
         "picture": google_info.get("picture"),
-        "role": "user",
+        "role": "master" if is_master else "user",
         "institution_id": None,
         "created_at": now_iso,
         "last_login_at": now_iso,
         "subscription": {
-            "plan_id": "free",
+            "plan_id": "master" if is_master else "free",
             "status": "active",
             "started_at": now_iso,
             "expires_at": None,
@@ -182,12 +204,12 @@ async def get_or_create_user(db, google_info: Dict[str, Any]) -> Dict[str, Any]:
             "current_period_start": now_iso,
             "current_period_end": period_end_iso,
             "generations_count": 0,
-            "generations_limit": FREE_GENERATIONS_PER_MONTH,
+            "generations_limit": 999999999 if is_master else FREE_GENERATIONS_PER_MONTH,
         },
     }
 
     await db.users.insert_one(new_user)
-    logger.info(f"[auth] Created new user: {email} ({user_id})")
+    logger.info(f"[auth] Created new user: {email} ({user_id}) [role={'master' if is_master else 'user'}]")
     return new_user
 
 
@@ -196,6 +218,7 @@ async def check_and_consume_quota(db, user_id: str) -> Dict[str, Any]:
     Check if the user has available generations for the current period.
     Resets quota if period expired. Increments usage by 1 on success.
     Throws 403 Forbidden if quota exceeded.
+    Master email / role is completely unrestricted with unlimited quota.
     """
     now = datetime.now(timezone.utc)
     now_iso = now.isoformat()
@@ -203,6 +226,29 @@ async def check_and_consume_quota(db, user_id: str) -> Dict[str, Any]:
     user = await db.users.find_one({"id": user_id})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+
+    email = (user.get("email") or "").lower().strip()
+    is_master = (
+        is_master_email(email)
+        or user.get("role") == "master"
+        or user.get("subscription", {}).get("plan_id") == "master"
+    )
+
+    # ── Master Account Bypass: ZERO restrictions ───────────────────────────────
+    if is_master:
+        await db.users.update_one(
+            {"id": user_id},
+            {"$inc": {"usage.generations_count": 1}}
+        )
+        count = user.get("usage", {}).get("generations_count", 0) + 1
+        logger.info(f"[quota] Master account {email} generated model (unrestricted). Count={count}")
+        return {
+            "used": count,
+            "limit": 999999999,
+            "remaining": 999999999,
+            "plan_id": "master",
+            "is_master": True,
+        }
 
     usage = user.get("usage", {})
     subscription = user.get("subscription", {})
@@ -301,6 +347,13 @@ async def get_current_user_from_request(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User account not found. Please sign in again.",
         )
+
+    if is_master_email(user.get("email")):
+        user["role"] = "master"
+        if "subscription" in user and isinstance(user["subscription"], dict):
+            user["subscription"]["plan_id"] = "master"
+        if "usage" in user and isinstance(user["usage"], dict):
+            user["usage"]["generations_limit"] = 999999999
 
     return user
 

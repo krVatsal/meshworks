@@ -42,6 +42,7 @@ interface AuthContextType {
   refreshUser: () => Promise<void>;
   handleGoogleCredential: (credential: string) => Promise<void>;
   isQuotaExceeded: boolean;
+  isMaster: boolean;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -125,8 +126,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     refreshUser();
   }, [refreshUser]);
 
+  const isMaster = Boolean(
+    user && (user.role === "master" || user.email?.toLowerCase() === "prompt2mesh@gmail.com")
+  );
+
   const isQuotaExceeded = Boolean(
     user &&
+    !isMaster &&
     user.subscription?.plan_id === "free" &&
     user.usage?.generations_count >= user.usage?.generations_limit
   );
@@ -145,6 +151,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         refreshUser,
         handleGoogleCredential,
         isQuotaExceeded,
+        isMaster,
       }}
     >
       {children}

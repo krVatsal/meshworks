@@ -25,6 +25,14 @@ PLANS: Dict[str, Dict[str, Any]] = {
         "description": "10 Free 3D model generations per month",
         "seats": 1,
     },
+    "master": {
+        "name": "Master Admin License",
+        "amount_inr": 0,
+        "period_days": 36500,
+        "generations_limit": 999999999,
+        "description": "Master account — unrestricted generations and admin privileges",
+        "seats": 999,
+    },
     "pro_monthly": {
         "name": "Pro Monthly",
         "amount_inr": 999,

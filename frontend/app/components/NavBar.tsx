@@ -3,7 +3,7 @@
 import { useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Search, Clock, Cpu, CreditCard, LogOut, User as UserIcon, Zap } from "lucide-react";
+import { Search, Clock, Cpu, CreditCard, LogOut, User as UserIcon, Zap, ShieldCheck } from "lucide-react";
 import { useAuth } from "../context/AuthContext";
 
 export default function NavBar() {
@@ -20,10 +20,13 @@ export default function NavBar() {
           ? "SUBSCRIPTION:PLANS"
           : "VIEWER:3D";
 
-  const planId = user?.subscription?.plan_id || "free";
+  const isMaster = Boolean(
+    user && (user.role === "master" || user.email?.toLowerCase() === "prompt2mesh@gmail.com")
+  );
+  const planId = isMaster ? "master" : (user?.subscription?.plan_id || "free");
   const gensCount = user?.usage?.generations_count ?? 0;
   const gensLimit = user?.usage?.generations_limit ?? 10;
-  const isFree = planId === "free";
+  const isFree = !isMaster && planId === "free";
 
   return (
     <>
@@ -100,16 +103,33 @@ export default function NavBar() {
                 <Link
                   href="/pricing"
                   className={`hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-mono tracking-wider border transition-all ${
-                    isFree && gensCount >= gensLimit
-                      ? "bg-red-500/10 border-red-500/30 text-red-400"
-                      : isFree
-                        ? "bg-cyber/10 border-cyber/30 text-cyber"
-                        : "bg-purple-500/10 border-purple-500/30 text-purple-300 font-bold"
+                    isMaster
+                      ? "bg-amber-500/10 border-amber-500/40 text-amber-300 font-bold shadow-[0_0_10px_rgba(245,158,11,0.2)]"
+                      : isFree && gensCount >= gensLimit
+                        ? "bg-red-500/10 border-red-500/30 text-red-400"
+                        : isFree
+                          ? "bg-cyber/10 border-cyber/30 text-cyber"
+                          : "bg-purple-500/10 border-purple-500/30 text-purple-300 font-bold"
                   }`}
-                  title={isFree ? `${gensCount}/${gensLimit} free generations used this month` : `${planId.toUpperCase()} Active`}
+                  title={
+                    isMaster
+                      ? "Master Account: Unlimited Generations (Zero Restrictions)"
+                      : isFree
+                        ? `${gensCount}/${gensLimit} free generations used this month`
+                        : `${planId.toUpperCase()} Active`
+                  }
                 >
-                  <Zap size={10} className={isFree ? "text-cyber" : "text-purple-400"} />
-                  {isFree ? `${gensCount}/${gensLimit} GENS` : planId.toUpperCase()}
+                  {isMaster ? (
+                    <>
+                      <ShieldCheck size={11} className="text-amber-400" />
+                      <span>MASTER (∞)</span>
+                    </>
+                  ) : (
+                    <>
+                      <Zap size={10} className={isFree ? "text-cyber" : "text-purple-400"} />
+                      <span>{isFree ? `${gensCount}/${gensLimit} GENS` : planId.toUpperCase()}</span>
+                    </>
+                  )}
                 </Link>
 
                 {/* User Dropdown Button */}
@@ -140,8 +160,10 @@ export default function NavBar() {
                       <div className="px-3 py-2 border-b border-white/10 space-y-0.5">
                         <div className="font-bold text-white truncate">{user.name}</div>
                         <div className="text-[10px] text-slate-400 truncate">{user.email}</div>
-                        <div className="text-[9px] text-cyber uppercase tracking-wider pt-1">
-                          Plan: {planId} ({gensCount}/{gensLimit} used)
+                        <div className={`text-[9px] uppercase tracking-wider pt-1 ${isMaster ? "text-amber-400 font-bold" : "text-cyber"}`}>
+                          {isMaster
+                            ? `Role: MASTER (Unlimited ∞)`
+                            : `Plan: ${planId} (${gensCount}/${gensLimit} used)`}
                         </div>
                       </div>
 
