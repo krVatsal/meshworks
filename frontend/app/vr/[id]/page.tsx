@@ -7,7 +7,7 @@ import Link from "next/link";
 import VRHolodeck from "@/app/components/vr/VRHolodeck";
 import { VRSessionInfo } from "@/app/components/vr/types";
 import { useAuth } from "@/app/context/AuthContext";
-import { ArrowLeft, AlertTriangle, ArrowRight, Loader2 } from "lucide-react";
+import { ArrowLeft, AlertTriangle, ArrowRight, Loader2, Lock } from "lucide-react";
 
 export default function VRPage() {
   const params = useParams();
@@ -20,6 +20,7 @@ export default function VRPage() {
   const [modelTitle, setModelTitle] = useState<string>("3D Model");
   const [sessionInfo, setSessionInfo] = useState<VRSessionInfo | null>(null);
   const [quotaExceeded, setQuotaExceeded] = useState<boolean>(false);
+  const [needsAuth, setNeedsAuth] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   useEffect(() => {
@@ -28,6 +29,8 @@ export default function VRPage() {
     const initVRSession = async () => {
       setLoading(true);
       setErrorMsg(null);
+      setNeedsAuth(false);
+      setQuotaExceeded(false);
 
       try {
         // 1. Fetch Model Data
@@ -69,6 +72,7 @@ export default function VRPage() {
       } catch (err: any) {
         console.error("[VR] Session initialization failed:", err);
         if (err.response?.status === 401) {
+          setNeedsAuth(true);
           setLoginModalOpen(true);
         } else if (
           err.response?.status === 403 &&
@@ -89,13 +93,47 @@ export default function VRPage() {
     };
 
     initVRSession();
-  }, [id, setLoginModalOpen]);
+  }, [id, user, setLoginModalOpen]);
 
   if (loading) {
     return (
       <div className="min-h-screen bg-black flex flex-col items-center justify-center space-y-4 text-cyber font-mono text-sm">
         <Loader2 className="animate-spin text-cyber" size={36} />
         <p className="tracking-widest">INITIALIZING VR HOLODECK ENGINE...</p>
+      </div>
+    );
+  }
+
+  // Sign In Required Gate
+  if (needsAuth) {
+    return (
+      <div className="min-h-screen bg-black flex items-center justify-center p-6">
+        <div className="max-w-md w-full p-8 rounded-2xl bg-slate-950 border border-cyber/40 text-center space-y-5">
+          <div className="w-12 h-12 mx-auto rounded-full bg-cyber/10 border border-cyber/30 flex items-center justify-center text-cyber">
+            <Lock size={24} />
+          </div>
+          <h1 className="text-2xl font-rajdhani font-bold text-white tracking-wider">
+            SIGN IN REQUIRED
+          </h1>
+          <p className="text-xs font-mono text-slate-400">
+            Sign in with your Google account to access your free monthly VR Holodeck session.
+          </p>
+          <div className="pt-2 flex flex-col gap-2">
+            <button
+              onClick={() => setLoginModalOpen(true)}
+              className="w-full inline-flex items-center justify-center gap-2 px-5 py-3 rounded-lg bg-cyber text-black font-rajdhani font-bold text-sm tracking-wider hover:bg-cyber/90 transition-all shadow-[0_0_20px_rgba(0,255,200,0.3)]"
+            >
+              SIGN IN WITH GOOGLE
+              <ArrowRight size={14} />
+            </button>
+            <button
+              onClick={() => router.push(`/view/${id}`)}
+              className="text-xs font-mono text-slate-400 hover:text-white pt-2"
+            >
+              Return to 2D Viewer
+            </button>
+          </div>
+        </div>
       </div>
     );
   }

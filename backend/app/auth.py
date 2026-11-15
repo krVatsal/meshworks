@@ -349,17 +349,23 @@ async def check_and_consume_quota(db, user_id: str) -> Dict[str, Any]:
 
 async def get_current_user_from_request(
     request: Request,
-    credentials: Optional[HTTPAuthorizationCredentials] = Security(security),
+    credentials: Optional[HTTPAuthorizationCredentials] = None,
 ) -> Dict[str, Any]:
     """Require valid user JWT token."""
     token = None
-    if credentials:
+    if credentials and isinstance(credentials, HTTPAuthorizationCredentials):
         token = credentials.credentials
-    else:
-        # Also check custom header or query for flexibility
+
+    if not token:
+        # Check custom header, bearer header, or query
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             token = auth_header.split("Bearer ")[1].strip()
+        elif auth_header:
+            token = auth_header.strip()
+
+    if not token:
+        token = request.query_params.get("token") or request.cookies.get("meshworks_token")
 
     if not token:
         raise HTTPException(
@@ -395,10 +401,10 @@ async def get_current_user_from_request(
 
 async def get_optional_current_user_from_request(
     request: Request,
-    credentials: Optional[HTTPAuthorizationCredentials] = Security(security),
+    credentials: Optional[HTTPAuthorizationCredentials] = None,
 ) -> Optional[Dict[str, Any]]:
     """Return user if authenticated, else None."""
     try:
         return await get_current_user_from_request(request, credentials)
-    except HTTPException:
+    except Exception:
         return None
