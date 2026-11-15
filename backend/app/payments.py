@@ -6,6 +6,9 @@ import logging
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from fastapi import HTTPException, status
 from pydantic import BaseModel
 import razorpay
@@ -15,6 +18,20 @@ logger = logging.getLogger(__name__)
 RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "").strip()
 RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "").strip()
 RAZORPAY_WEBHOOK_SECRET = os.environ.get("RAZORPAY_WEBHOOK_SECRET", "").strip()
+
+
+def get_razorpay_key_id() -> str:
+    """Dynamically get the Razorpay Key ID from env or module default."""
+    return (
+        os.environ.get("RAZORPAY_KEY_ID", "").strip()
+        or os.environ.get("NEXT_PUBLIC_RAZORPAY_KEY_ID", "").strip()
+        or RAZORPAY_KEY_ID
+    )
+
+
+def get_razorpay_key_secret() -> str:
+    """Dynamically get the Razorpay Key Secret from env or module default."""
+    return os.environ.get("RAZORPAY_KEY_SECRET", "").strip() or RAZORPAY_KEY_SECRET
 
 PLANS: Dict[str, Dict[str, Any]] = {
     "free": {
@@ -69,12 +86,14 @@ PLANS: Dict[str, Dict[str, Any]] = {
 
 
 def _get_razorpay_client() -> razorpay.Client:
-    if not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
+    key_id = get_razorpay_key_id()
+    key_secret = get_razorpay_key_secret()
+    if not key_id or not key_secret:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Razorpay payment gateway credentials not configured on server (RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET).",
         )
-    return razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
+    return razorpay.Client(auth=(key_id, key_secret))
 
 
 # ─── Request & Response Models ────────────────────────────────────────────────
@@ -134,7 +153,7 @@ async def create_payment_order(plan_id: str, user: Dict[str, Any]) -> CreateOrde
             order_id=order["id"],
             amount=amount_in_paise,
             currency="INR",
-            key_id=RAZORPAY_KEY_ID,
+            key_id=get_razorpay_key_id(),
             plan_id=plan_id,
             plan_name=plan["name"],
         )

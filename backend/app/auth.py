@@ -4,6 +4,9 @@ import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import jwt
 from fastapi import HTTPException, Security, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
